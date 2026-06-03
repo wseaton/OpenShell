@@ -38,7 +38,6 @@ yaml_quote() {
   value=${value//$'\t'/\\t}
   printf '"%s"' "${value}"
 }
-
 available_image_dirs() {
   local preferred
 
