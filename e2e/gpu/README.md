@@ -23,8 +23,8 @@ Each workload image must:
   command explicitly.
 
 OpenShell sandbox creation replaces the image entrypoint with the supervisor and
-does not run the OCI image `CMD`. When these images are used through OpenShell,
-the workload command from each manifest entry must be passed explicitly.
+does not run the OCI image `CMD`. E2e tests that use these images through
+OpenShell run the command from each manifest entry explicitly.
 
 The test harness is manifest-driven. Each workload entry carries:
 
