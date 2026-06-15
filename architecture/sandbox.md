@@ -77,7 +77,9 @@ where that socket directory is hidden before privilege drop.
 
 Credential placeholders in proxied HTTP requests can be resolved by the proxy
 when policy allows the target endpoint. Secrets must not be logged in OCSF or
-plain tracing output.
+plain tracing output. The supervisor uses revision-scoped placeholders for
+rotating provider credentials; provider environment keys beginning with
+`v<digits>_` are reserved for that placeholder namespace.
 
 Provider profiles can also declare dynamic token grants. For matching HTTP
 endpoints, the supervisor obtains a SPIFFE JWT-SVID from the local Workload API,
