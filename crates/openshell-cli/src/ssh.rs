@@ -29,6 +29,16 @@ use tokio::process::Command as TokioCommand;
 use tokio_stream::wrappers::ReceiverStream;
 
 const FOREGROUND_FORWARD_STARTUP_GRACE_PERIOD: Duration = Duration::from_secs(2);
+const HOST_TOOL_LINKER_ENV: &[&str] = &[
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "LIBRARY_PATH",
+    "NIX_LD_LIBRARY_PATH",
+];
 
 #[derive(Clone, Copy, Debug)]
 pub enum Editor {
@@ -121,6 +131,7 @@ async fn ssh_session_config(
         &session.token,
         gateway_name,
     );
+    let proxy_command = proxy_command_with_preserved_environment(proxy_command);
 
     Ok(SshSessionConfig {
         proxy_command,
@@ -137,6 +148,7 @@ fn ssh_base_command(proxy_command: &str) -> Command {
         std::env::var("OPENSHELL_SSH_LOG_LEVEL").unwrap_or_else(|_| "ERROR".to_string());
 
     let mut command = Command::new("ssh");
+    sanitize_host_tool_environment(&mut command);
     command
         .arg("-o")
         .arg(format!("ProxyCommand={proxy_command}"))
@@ -157,6 +169,30 @@ fn ssh_base_command(proxy_command: &str) -> Command {
         .arg("-o")
         .arg("ServerAliveCountMax=3");
     command
+}
+
+fn sanitize_host_tool_environment(command: &mut Command) {
+    for key in HOST_TOOL_LINKER_ENV {
+        command.env_remove(key);
+    }
+}
+
+fn proxy_command_with_preserved_environment(proxy_command: String) -> String {
+    let assignments = HOST_TOOL_LINKER_ENV
+        .iter()
+        .filter_map(|key| {
+            std::env::var_os(key).map(|value| {
+                let value = value.to_string_lossy();
+                format!("{key}={}", shell_escape(&value))
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if assignments.is_empty() {
+        proxy_command
+    } else {
+        format!("env {} {proxy_command}", assignments.join(" "))
+    }
 }
 
 #[cfg(unix)]
@@ -1507,6 +1543,93 @@ pub fn print_ssh_config(gateway: &str, name: &str) {
 mod tests {
     use super::*;
     use crate::TEST_ENV_LOCK;
+
+    #[test]
+    fn ssh_base_command_removes_host_linker_environment() {
+        let command = ssh_base_command("openshell ssh-proxy");
+        let removed_keys = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        for key in HOST_TOOL_LINKER_ENV {
+            assert!(
+                removed_keys.iter().any(|removed| removed == key),
+                "expected ssh command to remove {key}"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // Test-only: env vars require unsafe in Rust 2024.
+    fn proxy_command_preserves_linker_environment_for_proxy_child() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let old_env = HOST_TOOL_LINKER_ENV
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect::<Vec<_>>();
+
+        unsafe {
+            for key in HOST_TOOL_LINKER_ENV {
+                std::env::remove_var(key);
+            }
+            std::env::set_var("LD_LIBRARY_PATH", "/nix/store/z3 lib:/opt/lib");
+        }
+
+        let proxy_command =
+            proxy_command_with_preserved_environment("openshell ssh-proxy".to_string());
+        let has_assignment = proxy_command.contains("LD_LIBRARY_PATH='/nix/store/z3 lib:/opt/lib'");
+        let has_env_prefix = proxy_command.starts_with("env ");
+        let has_command = proxy_command.ends_with(" openshell ssh-proxy");
+
+        unsafe {
+            for (key, value) in old_env {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+
+        assert!(has_assignment, "unexpected proxy command: {proxy_command}");
+        assert!(has_env_prefix, "unexpected proxy command: {proxy_command}");
+        assert!(has_command, "unexpected proxy command: {proxy_command}");
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // Test-only: env vars require unsafe in Rust 2024.
+    fn proxy_command_is_unchanged_without_linker_environment() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let old_env = HOST_TOOL_LINKER_ENV
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect::<Vec<_>>();
+
+        unsafe {
+            for key in HOST_TOOL_LINKER_ENV {
+                std::env::remove_var(key);
+            }
+        }
+
+        let proxy_command =
+            proxy_command_with_preserved_environment("openshell ssh-proxy".to_string());
+
+        unsafe {
+            for (key, value) in old_env {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+
+        assert_eq!(proxy_command, "openshell ssh-proxy");
+    }
 
     #[test]
     fn upsert_host_block_appends_when_missing() {
