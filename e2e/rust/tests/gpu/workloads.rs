@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use openshell_e2e::harness::output::strip_ansi;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use serde::Deserialize;
+use serial_test::serial;
 
 const WORKLOAD_MANIFEST_ENV: &str = "OPENSHELL_E2E_WORKLOAD_MANIFEST";
 const GPU_WORKLOAD_SUCCESS_MARKER: &str = "OPENSHELL_GPU_WORKLOAD_SUCCESS";
@@ -51,16 +52,14 @@ fn workload_manifest_path() -> PathBuf {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(default_workload_manifest_path)
+        .map_or_else(default_workload_manifest_path, PathBuf::from)
 }
 
 fn load_workload_manifest() -> Option<WorkloadManifest> {
     let path = workload_manifest_path();
     let explicit_override = std::env::var(WORKLOAD_MANIFEST_ENV)
         .ok()
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false);
+        .is_some_and(|value| !value.trim().is_empty());
 
     let contents = match fs::read_to_string(&path) {
         Ok(contents) => contents,
@@ -150,6 +149,7 @@ async fn assert_expected_fail(workload: &WorkloadDefinition) {
 }
 
 #[tokio::test]
+#[serial(gpu)]
 async fn gpu_workload_manifest_runs_expected_workloads() {
     let Some(manifest) = load_workload_manifest() else {
         return;

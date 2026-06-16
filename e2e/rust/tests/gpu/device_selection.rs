@@ -13,6 +13,7 @@ use openshell_e2e::harness::container::{ContainerEngine, e2e_driver};
 use openshell_e2e::harness::output::strip_ansi;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use serde_json::{Map, Value};
+use serial_test::serial;
 use tokio::time::timeout;
 
 const SANDBOX_CREATE_TIMEOUT: Duration = Duration::from_secs(600);
@@ -214,8 +215,7 @@ fn default_cdi_gpu_device_id(device_ids: &[String], allow_all_devices: bool) -> 
     let mut named = device_ids
         .iter()
         .filter(|device_id| {
-            device_id.starts_with(CDI_GPU_DEVICE_PREFIX)
-                && device_id.as_str() != CDI_GPU_DEVICE_ALL
+            device_id.starts_with(CDI_GPU_DEVICE_PREFIX) && device_id.as_str() != CDI_GPU_DEVICE_ALL
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -335,9 +335,11 @@ async fn sandbox_create_output(args: &[&str]) -> String {
 }
 
 #[tokio::test]
+#[serial(gpu)]
 async fn gpu_request_without_device_matches_plain_default_gpu_container() {
     let device_ids = discovered_cdi_gpu_device_ids();
-    let Some(default_gpu_device) = default_cdi_gpu_device_id(&device_ids, all_gpu_default_allowed())
+    let Some(default_gpu_device) =
+        default_cdi_gpu_device_id(&device_ids, all_gpu_default_allowed())
     else {
         eprintln!("skipping default GPU request test because no selectable GPU ID was discovered");
         return;
@@ -353,6 +355,7 @@ async fn gpu_request_without_device_matches_plain_default_gpu_container() {
 }
 
 #[tokio::test]
+#[serial(gpu)]
 async fn gpu_request_for_each_discovered_device_matches_plain_container() {
     let device_ids: Vec<_> = discovered_cdi_gpu_device_ids()
         .into_iter()
@@ -377,6 +380,7 @@ async fn gpu_request_for_each_discovered_device_matches_plain_container() {
 }
 
 #[tokio::test]
+#[serial(gpu)]
 async fn gpu_all_device_request_matches_plain_all_gpu_container() {
     if !has_cdi_gpu_device(CDI_GPU_DEVICE_ALL) {
         eprintln!(
@@ -395,6 +399,7 @@ async fn gpu_all_device_request_matches_plain_all_gpu_container() {
 }
 
 #[tokio::test]
+#[serial(gpu)]
 async fn gpu_invalid_device_request_fails() {
     let driver_config_json = cdi_devices_driver_config_json(&["nvidia.com/gpu=invalid"]);
     let args = vec![
