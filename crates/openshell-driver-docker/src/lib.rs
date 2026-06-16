@@ -79,7 +79,8 @@ const DOCKER_NETWORK_DRIVER: &str = "bridge";
 
 /// Default image holding the Linux `openshell-sandbox` binary. The gateway
 /// pulls this image and extracts the binary to a host-side cache when no
-/// explicit `supervisor_bin` override or local build is available.
+/// explicit `supervisor_bin`, configured `supervisor_image`, sibling binary,
+/// or local build is available.
 const DEFAULT_DOCKER_SUPERVISOR_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/supervisor";
 
 /// Return the default `ghcr.io/nvidia/openshell/supervisor:<tag>` reference
@@ -2960,7 +2961,14 @@ pub(crate) async fn resolve_supervisor_bin(
         return Ok(path);
     }
 
-    // Tier 2: sibling `openshell-sandbox` next to the running gateway
+    // Tier 2: explicit supervisor_image in [openshell.drivers.docker].
+    // A configured image should be the source of truth even when a local
+    // developer build is present under target/.
+    if let Some(image) = docker_config.supervisor_image.clone() {
+        return extract_supervisor_bin_from_image(docker, &image).await;
+    }
+
+    // Tier 3: sibling `openshell-sandbox` next to the running gateway
     // (release artifact layout). Linux-only because the sibling must be a
     // Linux ELF to bind-mount into a Linux container.
     if cfg!(target_os = "linux") {
@@ -2977,9 +2985,9 @@ pub(crate) async fn resolve_supervisor_bin(
         }
     }
 
-    // Tier 3: local cargo target build (developer workflow). Preferred
-    // over a registry pull when available because it matches whatever the
-    // developer just built.
+    // Tier 4: local cargo target build (developer workflow). Preferred
+    // over the default registry image when available because it matches
+    // whatever the developer just built.
     let target_candidates = linux_supervisor_candidates(daemon_arch);
     for candidate in &target_candidates {
         if candidate.is_file() {
@@ -2990,13 +2998,9 @@ pub(crate) async fn resolve_supervisor_bin(
         }
     }
 
-    // Tier 4: pull the supervisor image from a registry and extract the
-    // binary to a host-side cache keyed by image content digest. This is
-    // the default path for released gateway binaries.
-    let image = docker_config
-        .supervisor_image
-        .clone()
-        .unwrap_or_else(default_docker_supervisor_image);
+    // Tier 5: pull the release-matched default supervisor image and extract
+    // the binary to a host-side cache keyed by image content digest.
+    let image = default_docker_supervisor_image();
     extract_supervisor_bin_from_image(docker, &image).await
 }
 

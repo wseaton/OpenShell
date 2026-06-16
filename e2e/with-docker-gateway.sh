@@ -81,7 +81,6 @@ DOCKER_NETWORK_NAME=""
 DOCKER_NETWORK_CONNECTED_CONTAINER=""
 DOCKER_NETWORK_MANAGED=0
 GPU_MODE="${OPENSHELL_E2E_DOCKER_GPU:-0}"
-DOCKER_SUPERVISOR_ARGS=()
 
 # Isolate CLI/SDK gateway metadata from the developer's real config.
 export XDG_CONFIG_HOME="${WORKDIR}/config"
@@ -263,25 +262,6 @@ if [ "${GPU_MODE}" = "1" ]; then
   fi
 fi
 
-normalize_arch() {
-  case "$1" in
-    x86_64|amd64) echo "amd64" ;;
-    aarch64|arm64) echo "arm64" ;;
-    *) echo "$1" ;;
-  esac
-}
-
-linux_target_triple() {
-  case "$1" in
-    amd64) echo "x86_64-unknown-linux-gnu" ;;
-    arm64) echo "aarch64-unknown-linux-gnu" ;;
-    *)
-      echo "ERROR: unsupported Docker daemon architecture '$1'" >&2
-      exit 2
-      ;;
-  esac
-}
-
 resolve_docker_supervisor_image() {
   if [ -n "${OPENSHELL_DOCKER_SUPERVISOR_IMAGE:-}" ]; then
     printf '%s\n' "${OPENSHELL_DOCKER_SUPERVISOR_IMAGE}"
@@ -304,7 +284,7 @@ resolve_docker_supervisor_image() {
     return 0
   fi
 
-  printf '%s\n' ""
+  printf '%s\n' "openshell/supervisor:dev"
 }
 
 docker_pull_with_retry() {
@@ -335,6 +315,21 @@ docker_pull_with_retry() {
 
 ensure_docker_supervisor_image() {
   local image=$1
+
+  if [ "${image}" = "openshell/supervisor:dev" ] \
+     && [ -z "${OPENSHELL_DOCKER_SUPERVISOR_IMAGE:-}" ] \
+     && [ -z "${OPENSHELL_SUPERVISOR_IMAGE:-}" ] \
+     && [ -z "${CI:-}" ]; then
+    echo "Building local Docker supervisor image ${image}..."
+    CONTAINER_ENGINE=docker IMAGE_TAG=dev \
+      bash "${ROOT}/tasks/scripts/docker-build-image.sh" supervisor
+    if docker image inspect "${image}" >/dev/null 2>&1; then
+      return 0
+    fi
+
+    echo "ERROR: expected supervisor image '${image}' after local build." >&2
+    exit 2
+  fi
 
   if docker image inspect "${image}" >/dev/null 2>&1; then
     return 0
@@ -385,47 +380,11 @@ ensure_sandbox_image_available() {
   docker_pull_with_retry "${image}"
 }
 
-DAEMON_ARCH="$(normalize_arch "$(docker info --format '{{.Architecture}}' 2>/dev/null || true)")"
-SUPERVISOR_TARGET="$(linux_target_triple "${DAEMON_ARCH}")"
-HOST_OS="$(uname -s)"
-HOST_ARCH="$(normalize_arch "$(uname -m)")"
-SUPERVISOR_OUT_DIR="${WORKDIR}/supervisor/${DAEMON_ARCH}"
-SUPERVISOR_BIN="${SUPERVISOR_OUT_DIR}/openshell-sandbox"
-
-CARGO_BUILD_JOBS_ARG=()
-if [ -n "${CARGO_BUILD_JOBS:-}" ]; then
-  CARGO_BUILD_JOBS_ARG=(-j "${CARGO_BUILD_JOBS}")
-fi
-
 e2e_build_gateway_binaries "${ROOT}" TARGET_DIR GATEWAY_BIN CLI_BIN
 
 SUPERVISOR_IMAGE="$(resolve_docker_supervisor_image)"
-if [ -n "${SUPERVISOR_IMAGE}" ]; then
-  ensure_docker_supervisor_image "${SUPERVISOR_IMAGE}"
-  echo "Using Docker supervisor image: ${SUPERVISOR_IMAGE}"
-  DOCKER_SUPERVISOR_ARGS=(--docker-supervisor-image "${SUPERVISOR_IMAGE}")
-else
-  echo "Building openshell-sandbox for ${SUPERVISOR_TARGET}..."
-  mkdir -p "${SUPERVISOR_OUT_DIR}"
-  if [ "${HOST_OS}" = "Linux" ] && [ "${HOST_ARCH}" = "${DAEMON_ARCH}" ]; then
-    rustup target add "${SUPERVISOR_TARGET}" >/dev/null 2>&1 || true
-    cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
-      --release -p openshell-sandbox --target "${SUPERVISOR_TARGET}"
-    cp "${TARGET_DIR}/${SUPERVISOR_TARGET}/release/openshell-sandbox" "${SUPERVISOR_BIN}"
-  else
-    CONTAINER_ENGINE=docker \
-    DOCKER_PLATFORM="linux/${DAEMON_ARCH}" \
-    DOCKER_OUTPUT="type=local,dest=${SUPERVISOR_OUT_DIR}" \
-      bash "${ROOT}/tasks/scripts/docker-build-image.sh" supervisor-output
-  fi
-
-  if [ ! -f "${SUPERVISOR_BIN}" ]; then
-    echo "ERROR: expected supervisor binary at ${SUPERVISOR_BIN}" >&2
-    exit 1
-  fi
-  chmod +x "${SUPERVISOR_BIN}"
-  DOCKER_SUPERVISOR_ARGS=(--docker-supervisor-bin "${SUPERVISOR_BIN}")
-fi
+ensure_docker_supervisor_image "${SUPERVISOR_IMAGE}"
+echo "Using Docker supervisor image: ${SUPERVISOR_IMAGE}"
 
 DEFAULT_SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 SANDBOX_IMAGE="${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE:-${OPENSHELL_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}}"
@@ -493,19 +452,7 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
   printf 'guest_tls_cert = %s\n'       "$(toml_string "${PKI_DIR}/client/tls.crt")"
   printf 'guest_tls_key = %s\n'        "$(toml_string "${PKI_DIR}/client/tls.key")"
   printf 'enable_bind_mounts = true\n'
-  # DOCKER_SUPERVISOR_ARGS holds either ("--docker-supervisor-bin" "<path>")
-  # or ("--docker-supervisor-image" "<image>"); both map to TOML keys on
-  # the docker driver config.
-  for ((i=0; i<${#DOCKER_SUPERVISOR_ARGS[@]}; i+=2)); do
-    case "${DOCKER_SUPERVISOR_ARGS[$i]}" in
-      --docker-supervisor-bin)
-        printf 'supervisor_bin = %s\n'   "$(toml_string "${DOCKER_SUPERVISOR_ARGS[$((i+1))]}")"
-        ;;
-      --docker-supervisor-image)
-        printf 'supervisor_image = %s\n' "$(toml_string "${DOCKER_SUPERVISOR_ARGS[$((i+1))]}")"
-        ;;
-    esac
-  done
+  printf 'supervisor_image = %s\n'     "$(toml_string "${SUPERVISOR_IMAGE}")"
   if [ -n "${GATEWAY_HOST_ALIAS_IP}" ]; then
     printf 'host_gateway_ip = %s\n'    "$(toml_string "${GATEWAY_HOST_ALIAS_IP}")"
   fi
