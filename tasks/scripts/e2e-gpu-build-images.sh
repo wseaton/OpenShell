@@ -83,15 +83,29 @@ image_expectation() {
 
 workload_input_fingerprint() {
   local -a names=("$@")
+  local digest
+  local file
+  local name
+  local rel
 
   {
+    printf 'schema=openshell-gpu-workload-input-v1\n'
     printf 'OPENSHELL_SANDBOX_BASE_IMAGE=%s\n' "${BASE_IMAGE}"
     if contains_image cuda-basic "${names[@]}"; then
       printf 'CUDA_BUILD_IMAGE=%s\n' "${CUDA_BUILD_IMAGE}"
       printf 'CUDA_SAMPLES_REPO=%s\n' "${CUDA_SAMPLES_REPO}"
       printf 'CUDA_SAMPLES_REF=%s\n' "${CUDA_SAMPLES_REF}"
     fi
-  } | git -C "${ROOT}" hash-object --stdin | cut -c1-8
+    for name in "${names[@]}"; do
+      printf 'WORKLOAD=%s\n' "${name}"
+      while IFS= read -r -d '' file; do
+        rel="${file#"${ROOT}/"}"
+        digest="$(sha256sum "${file}" | cut -d ' ' -f 1)"
+        printf 'FILE=%s\n' "${rel}"
+        printf 'SHA256=%s\n' "${digest}"
+      done < <(find "${IMAGES_ROOT}/${name}" -type f -print0 | sort -z)
+    done
+  } | sha256sum | cut -c1-12
 }
 
 mapfile -t available < <(available_image_dirs)
@@ -122,28 +136,18 @@ if [[ ${#selected[@]} -eq 0 ]]; then
   exit 1
 fi
 
-source_sha="$(git -C "${ROOT}" rev-parse HEAD)"
-source_short_sha="$(git -C "${ROOT}" rev-parse --short HEAD)"
-source_dirty=false
-if [[ -n "$(git -C "${ROOT}" status --short)" ]]; then
-  source_dirty=true
-fi
+input_fingerprint="$(workload_input_fingerprint "${selected[@]}")"
 
 if [[ -n "${OPENSHELL_GPU_WORKLOAD_IMAGE_TAG:-}" ]]; then
   image_tag="${OPENSHELL_GPU_WORKLOAD_IMAGE_TAG}"
 else
-  input_fingerprint="$(workload_input_fingerprint "${selected[@]}")"
-  image_tag="${source_short_sha}-${input_fingerprint}"
-  if [[ "${source_dirty}" == "true" ]]; then
-    image_tag="${image_tag}-dirty"
-  fi
+  image_tag="${input_fingerprint}"
 fi
-input_fingerprint="$(workload_input_fingerprint "${selected[@]}")"
 
 declare -A image_refs=()
 
 echo "Building GPU workload images with ${CONTAINER_ENGINE}"
-echo "Source: ${source_short_sha} (dirty: ${source_dirty})"
+echo "Fingerprint: ${input_fingerprint}"
 echo "Tag: ${image_tag}"
 
 for name in "${selected[@]}"; do
@@ -158,7 +162,6 @@ for name in "${selected[@]}"; do
     --label "com.nvidia.openshell.gpu-workload.source=${name}"
     --label "com.nvidia.openshell.gpu-workload.base-image=${BASE_IMAGE}"
     --label "com.nvidia.openshell.gpu-workload.input-fingerprint=${input_fingerprint}"
-    --label "org.opencontainers.image.revision=${source_sha}"
   )
   if [[ "${name}" == "cuda-basic" ]]; then
     build_args+=(
@@ -194,8 +197,6 @@ manifest_path="${BUILD_DIR}/workloads.yaml"
   echo "# Source this file to use the most recently built GPU workload images."
   write_env_var OPENSHELL_GPU_WORKLOAD_IMAGE_TAG "${image_tag}"
   write_env_var OPENSHELL_GPU_WORKLOAD_IMAGE_SOURCE_PATH "${IMAGES_ROOT}"
-  write_env_var OPENSHELL_GPU_WORKLOAD_IMAGE_SOURCE_SHA "${source_sha}"
-  write_env_var OPENSHELL_GPU_WORKLOAD_IMAGE_SOURCE_DIRTY "${source_dirty}"
   write_env_var OPENSHELL_GPU_WORKLOAD_IMAGE_INPUT_FINGERPRINT "${input_fingerprint}"
   write_env_var OPENSHELL_SANDBOX_BASE_IMAGE "${BASE_IMAGE}"
   write_env_var CUDA_BUILD_IMAGE "${CUDA_BUILD_IMAGE}"
@@ -213,8 +214,6 @@ manifest_path="${BUILD_DIR}/workloads.yaml"
   echo "generated_by: $(yaml_quote "mise run e2e:workloads:build")"
   echo "source:"
   echo "  path: $(yaml_quote "${IMAGES_ROOT}")"
-  echo "  revision: $(yaml_quote "${source_sha}")"
-  echo "  dirty: ${source_dirty}"
   echo "  input_fingerprint: $(yaml_quote "${input_fingerprint}")"
   echo "  container_engine: $(yaml_quote "${CONTAINER_ENGINE}")"
   echo "  inputs:"

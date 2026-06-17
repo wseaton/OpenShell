@@ -61,9 +61,9 @@ The build task uses `tasks/scripts/container-engine.sh`. Set
 `CONTAINER_ENGINE=docker` or `CONTAINER_ENGINE=podman` to choose an engine
 explicitly. When unset, the helper uses its existing auto-detection behavior.
 
-Local tags use the current commit short SHA plus a short fingerprint of the
-external build inputs. Dirty local trees append `-dirty`. Set
-`OPENSHELL_GPU_WORKLOAD_IMAGE_TAG=<tag>` to override the tag.
+Local tags use a short SHA-256 fingerprint of the selected workload contexts
+and external build inputs. Set `OPENSHELL_GPU_WORKLOAD_IMAGE_TAG=<tag>` to
+override the tag.
 
 The task writes the latest build refs to:
 
