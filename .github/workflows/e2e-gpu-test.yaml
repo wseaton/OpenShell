@@ -65,5 +65,8 @@ jobs:
           docker info --format '{{json .CDISpecDirs}}'
           docker run --rm --device nvidia.com/gpu=all "${OPENSHELL_E2E_GPU_PROBE_IMAGE}" nvidia-smi -L
 
+      - name: Build GPU workload images
+        run: mise run --no-deps --skip-deps e2e:workloads:build
+
       - name: Run tests
         run: mise run --no-deps --skip-deps e2e:docker:gpu
