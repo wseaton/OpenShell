@@ -65,10 +65,10 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     apt-get update && apt-get install -y --no-install-recommends gh && \
     rm -rf /var/lib/apt/lists/*
 
-COPY runtime/harnesses/codex/install-codex.sh /usr/local/bin/install-codex.sh
 ARG CODEX_VERSION=latest
-RUN chmod 755 /usr/local/bin/install-codex.sh && \
-    /usr/local/bin/install-codex.sh "$CODEX_VERSION"
+RUN npm install -g "@openai/codex@${CODEX_VERSION}" && \
+    (npm cache clean --force >/dev/null 2>&1 || true) && \
+    codex --version
 
 # Provider profiles include both /usr/bin and /usr/local/bin variants for common
 # tools. Create the /usr/local/bin aliases in this image so sandbox symlink
@@ -82,7 +82,11 @@ FROM devtools AS final
 ENV PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
 
 RUN mkdir -p /etc/openshell
-COPY gator/policy.yaml /etc/openshell/policy.yaml
+COPY policy.yaml /etc/openshell/policy.yaml
+COPY bin/gh /usr/local/bin/gh-gator
+RUN rm -f /usr/local/bin/gh && \
+    cp /usr/local/bin/gh-gator /usr/local/bin/gh && \
+    chmod 755 /usr/local/bin/gh
 
 RUN printf 'export PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"\nexport PS1="\\u@\\h:\\w\\$ "\n' \
         > /sandbox/.bashrc && \

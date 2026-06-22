@@ -183,7 +183,7 @@ warns that the later file is shadowed.
 - `gator/agent.yaml` for the launch contract.
 - `gator/prompts/gator.md` for the rendered operator prompt.
 - `gator/providers/` for scoped GitHub and Codex provider profiles.
-- `Dockerfile.gator` for the local sandbox image.
+- `gator/Dockerfile` for the local sandbox image.
 - `runtime/harnesses/codex/` for Codex installation and execution.
 
 Run it through the generic launcher:

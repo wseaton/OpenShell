@@ -7,7 +7,7 @@ description: Validate and monitor OpenShell GitHub issues and pull requests thro
 
 sandbox:
   name_prefix: gator
-  from: agent://../Dockerfile.gator
+  from: agent://.
   gateway: docker-dev
   background_log_dir: logs
 

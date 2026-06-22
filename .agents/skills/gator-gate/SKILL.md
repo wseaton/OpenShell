@@ -64,21 +64,23 @@ All comments posted by this skill must begin with this marker:
 > **gator-agent**
 ```
 
-Use one canonical gator comment per issue or PR for baseline state summaries when possible. Edit it only for housekeeping updates that do not respond to new human activity.
+Use one canonical gator comment per issue or PR head SHA for baseline state summaries when possible. Edit it only for housekeeping updates that do not respond to new human activity.
 
-When gator is continuing a conversation after a human comment, review, or requested change, post a new marked comment. Do not edit an older comment for these conversational turns, because that hides the progression from PR readers.
+When gator is continuing a conversation after a human comment, review, or requested change, post a new marked comment only if the PR head SHA changed or no marked gator comment/review exists for the current head SHA. If a marked gator comment or PR review already exists for the current head SHA, do not post another public comment; record the state in the supervised result sentinel and wait for a new commit, maintainer override, merge, or closure.
 
 ## Human Comment Disposition
 
 Every substantive human comment or review after a gator request must be addressed in the next gator action. Do not silently keep the same state when an author, maintainer, or reviewer responds.
 
-When a human response claims that requested changes were made, re-check the latest head and publicly disposition the response in a new marked comment:
+The one-comment-per-head-SHA rule is stronger than the human response disposition rule. If the current head SHA already has a marked gator comment or PR review, do not post a same-SHA human response disposition unless a maintainer explicitly asks for a same-SHA public response.
+
+When a human response claims that requested changes were made, re-check the latest head and publicly disposition the response in a new marked comment only when no marked gator comment/review exists for that head SHA:
 
 - If the response resolves the feedback, say it is resolved and move to the next state.
 - If the response does not resolve the feedback, explicitly acknowledge the response and list what remains unresolved.
 - If the response is ambiguous, ask the minimal clarifying question and keep the appropriate waiting state.
 
-The disposition must mention the relevant human response by author or timestamp when useful, include the current head SHA for PRs, and explain the next expected action. Do not edit the canonical gator comment for this disposition; continue the thread with a new comment so PR readers can see that new activity occurred after the human response.
+The disposition must mention the relevant human response by author or timestamp when useful, include the current head SHA for PRs, and explain the next expected action. Do not edit the canonical gator comment for this disposition; continue the thread with a new comment only when the current head SHA does not already have a marked gator disposition.
 
 ## Labels
 
@@ -482,6 +484,18 @@ If TTL expires:
 
 When a PR enters `gator:in-review`, run an independent code-only review.
 
+Before running the reviewer or posting any marked gator comment/review, check whether gator has already posted for the current PR head SHA. Search existing issue comments and PR reviews for the gator marker and either `Head SHA: <sha>`, `Head SHA: `<sha>``, or the current `headRefOid` anywhere in the body. Gator may post at most one marked public disposition for a given head SHA.
+
+If the current head SHA already has a marked gator comment or PR review:
+
+- Do not run the reviewer sub-agent again for that SHA.
+- Do not post another marked issue comment, `PR Review Status`, `Re-check After ... Update`, CI update, duplicate findings summary, or PR review for that SHA.
+- Reuse the latest gator disposition for that SHA internally to decide whether the PR is still waiting on author action, ready for pipeline watch, or blocked.
+- For any same-SHA status update, including CI completion, failed checks, human replies, label changes, or maintainer/reviewer comments, do not post a public comment. Record the next state only in the supervised result sentinel.
+- Do not post author, maintainer, or blocker nudges for the same SHA. Wait for a new commit, merge, closure, or explicit maintainer override.
+
+Only run a fresh review or post another marked public disposition when the PR head SHA changes, a maintainer explicitly asks gator to re-review or publicly respond on the same SHA, the PR reaches terminal merged/closed cleanup, or the earlier gator attempt failed before posting any marked disposition.
+
 For PRs authored by `dependabot[bot]`, the primary gator responsibility is dependency-update validation, not normal feature review. Do a quick sanity check for suspicious changes outside expected dependency manifests or lockfiles, then ensure the full required test suite runs, including E2E, and watch for breakages caused by the update.
 
 Use the `principal-engineer-reviewer` sub-agent. Include:
@@ -506,7 +520,7 @@ For validated PRs with direct user-facing UX changes, require Fern docs updates 
 
 If no blocking findings remain, decide whether E2E labels are needed, then move to `gator:watch-pipeline`.
 
-When resuming a PR already in `gator:in-review`, check whether gator review findings or maintainer review comments are still unanswered. If the PR author has pushed commits or replied after the latest feedback, re-review only the relevant changes, decide whether the feedback is resolved, and publicly disposition the author response as described in Human Comment Disposition.
+When resuming a PR already in `gator:in-review`, check whether gator review findings or maintainer review comments are still unanswered. If the PR author has pushed commits, compare the latest commit SHA with the last gator-reviewed SHA; run a fresh review only when the SHA changed. If the PR author replied without pushing a new commit, do not re-review, repost findings, or post a same-SHA disposition; inspect the response internally and wait for a new commit or maintainer override. If CI changes state without a new commit, do not post a same-SHA CI update.
 
 If review feedback is waiting on the PR author for more than 48 business hours, post a single author nudge. Use the latest of these timestamps as the TTL start:
 
