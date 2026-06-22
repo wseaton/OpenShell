@@ -243,12 +243,14 @@ mod tests {
             10,
             HashMap::from([("GITHUB_TOKEN".to_string(), "old".to_string())]),
             HashMap::new(),
+            HashMap::new(),
         );
 
         for revision in 11..20 {
             state.install_environment(
                 revision,
                 HashMap::from([("GITHUB_TOKEN".to_string(), format!("new-{revision}"))]),
+                HashMap::new(),
                 HashMap::new(),
             );
         }
@@ -266,12 +268,14 @@ mod tests {
             10,
             HashMap::from([("GITHUB_TOKEN".to_string(), "old".to_string())]),
             HashMap::new(),
+            HashMap::new(),
         );
 
         for revision in 11..20 {
             state.install_environment(
                 revision,
                 HashMap::from([("OTHER_TOKEN".to_string(), format!("other-{revision}"))]),
+                HashMap::new(),
                 HashMap::new(),
             );
         }
