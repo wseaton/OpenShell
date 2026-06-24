@@ -3142,6 +3142,7 @@ mod tests {
         assert_eq!(
             ids,
             vec![
+                "aws",
                 "aws-bedrock",
                 "claude-code",
                 "codex",

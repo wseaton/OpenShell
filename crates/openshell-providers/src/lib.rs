@@ -119,6 +119,7 @@ impl ProviderRegistry {
         registry.register(providers::github::SPEC);
         registry.register(providers::gitlab::SPEC);
         registry.register(providers::google_cloud::GoogleCloudProvider);
+        registry.register(providers::aws::AwsProvider);
         registry.register(providers::outlook::OutlookProvider);
         registry.register(providers::vertex::VertexProvider);
         registry
@@ -196,6 +197,7 @@ pub fn normalize_provider_type(input: &str) -> Option<&'static str> {
         "copilot" => Some("copilot"),
         "opencode" => Some("opencode"),
         "gcp" | "google-cloud" => Some("google-cloud"),
+        "aws" | "amazon" => Some("aws"),
         "generic" => Some("generic"),
         "gitlab" | "glab" => Some("gitlab"),
         "github" | "gh" => Some("github"),

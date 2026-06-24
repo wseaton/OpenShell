@@ -744,6 +744,9 @@ fn refresh_strategy_label(strategy: i32) -> &'static str {
         openshell_core::proto::ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => {
             "google_service_account_jwt"
         }
+        openshell_core::proto::ProviderCredentialRefreshStrategy::AwsAssumeRoleWithWebIdentity => {
+            "aws_assume_role_with_web_identity"
+        }
         openshell_core::proto::ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
 }

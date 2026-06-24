@@ -21,6 +21,7 @@ use std::sync::OnceLock;
 const PATH_TEMPLATE_CREDENTIAL_PLACEHOLDER: &str = "{credential}";
 
 const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
+    include_str!("../../../providers/aws.yaml"),
     include_str!("../../../providers/aws-bedrock.yaml"),
     include_str!("../../../providers/claude-code.yaml"),
     include_str!("../../../providers/codex.yaml"),
@@ -479,6 +480,7 @@ impl CredentialRefreshProfile {
             ProviderCredentialRefreshStrategy::Oauth2RefreshToken
                 | ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
                 | ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt
+                | ProviderCredentialRefreshStrategy::AwsAssumeRoleWithWebIdentity
         )
     }
 }
@@ -639,6 +641,9 @@ pub fn provider_refresh_strategy_from_yaml(raw: &str) -> Option<ProviderCredenti
         "google_service_account_jwt" => {
             Some(ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt)
         }
+        "aws_assume_role_with_web_identity" => {
+            Some(ProviderCredentialRefreshStrategy::AwsAssumeRoleWithWebIdentity)
+        }
         _ => None,
     }
 }
@@ -653,6 +658,9 @@ pub fn provider_refresh_strategy_to_yaml(
         ProviderCredentialRefreshStrategy::Oauth2RefreshToken => "oauth2_refresh_token",
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
+        ProviderCredentialRefreshStrategy::AwsAssumeRoleWithWebIdentity => {
+            "aws_assume_role_with_web_identity"
+        }
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
 }

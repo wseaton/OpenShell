@@ -70,6 +70,7 @@ def provider(
     name: str,
     provider_type: str,
     credentials: dict[str, str],
+    config: dict[str, str] | None = None,
 ) -> Iterator[str]:
     """Create a provider for the duration of the block, then delete it."""
     _delete_provider(stub, name)
@@ -79,6 +80,7 @@ def provider(
                 metadata=datamodel_pb2.ObjectMeta(name=name),
                 type=provider_type,
                 credentials=credentials,
+                config=config or {},
             )
         )
     )
@@ -194,6 +196,44 @@ def test_nvidia_provider_injects_nvidia_api_key_env_var(
             assert _is_placeholder_for_env_key(
                 result.stdout.strip(), "NVIDIA_API_KEY"
             )
+
+
+def test_aws_provider_injects_container_credentials_endpoint(
+    sandbox: Callable[..., Sandbox],
+    sandbox_client: SandboxClient,
+) -> None:
+    """AWS provider points the SDK at the loopback container-credentials emulator.
+
+    The static credential vars must be absent so the SDK falls through to the
+    emulator, and the region must resolve to its real (non-placeholder) value.
+    """
+    with provider(
+        sandbox_client._stub,
+        name="e2e-test-aws-provider-env",
+        provider_type="aws",
+        credentials={},
+        config={"region": "us-east-1"},
+    ) as provider_name:
+        spec = datamodel_pb2.SandboxSpec(
+            policy=_default_policy(),
+            providers=[provider_name],
+        )
+
+        def read_aws_env() -> str:
+            import os
+
+            uri = os.environ.get("AWS_CONTAINER_CREDENTIALS_FULL_URI", "NOT_SET")
+            region = os.environ.get("AWS_REGION", "NOT_SET")
+            access_key = os.environ.get("AWS_ACCESS_KEY_ID", "ABSENT")
+            return f"{uri}|{region}|{access_key}"
+
+        with sandbox(spec=spec, delete_on_exit=True) as sb:
+            result = sb.exec_python(read_aws_env)
+            assert result.exit_code == 0, result.stderr
+            uri, region, access_key = result.stdout.strip().split("|")
+            assert uri == "http://127.0.0.1:8175/creds"
+            assert region == "us-east-1"
+            assert access_key == "ABSENT"
 
 
 def test_attach_detach_updates_credentials_for_later_exec_launches(

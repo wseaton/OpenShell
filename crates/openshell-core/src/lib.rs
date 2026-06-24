@@ -11,6 +11,7 @@
 
 pub mod activity;
 pub mod auth;
+pub mod aws;
 pub mod config;
 pub mod denial;
 pub mod driver_mounts;

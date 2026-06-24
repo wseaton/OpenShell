@@ -279,6 +279,9 @@ pub fn refresh_strategy_name(strategy: i32) -> &'static str {
         ProviderCredentialRefreshStrategy::Oauth2RefreshToken => "oauth2_refresh_token",
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
+        ProviderCredentialRefreshStrategy::AwsAssumeRoleWithWebIdentity => {
+            "aws_assume_role_with_web_identity"
+        }
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
 }
@@ -289,6 +292,7 @@ pub fn is_gateway_mintable_strategy(strategy: ProviderCredentialRefreshStrategy)
         ProviderCredentialRefreshStrategy::Oauth2RefreshToken
             | ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
             | ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt
+            | ProviderCredentialRefreshStrategy::AwsAssumeRoleWithWebIdentity
     )
 }
 
@@ -449,6 +453,9 @@ async fn mint_credential(
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => {
             mint_google_service_account_jwt(state).await
         }
+        ProviderCredentialRefreshStrategy::AwsAssumeRoleWithWebIdentity => {
+            mint_aws_assume_role_with_web_identity(state).await
+        }
         ProviderCredentialRefreshStrategy::External
         | ProviderCredentialRefreshStrategy::Static
         | ProviderCredentialRefreshStrategy::Unspecified => Err(Status::failed_precondition(
@@ -542,6 +549,154 @@ async fn mint_google_service_account_jwt(
         ("assertion".to_string(), assertion),
     ];
     request_token(&token_url, &form, lifetime_secs).await
+}
+
+/// STS imposes a 900-second floor on `DurationSeconds`. Requesting less is a
+/// hard error, so clamp up.
+const STS_MIN_DURATION_SECONDS: i64 = 900;
+
+/// Mint short-lived AWS credentials via `AssumeRoleWithWebIdentity`.
+///
+/// This call is *unsigned*: it authenticates with the web-identity token (a
+/// projected Kubernetes `ServiceAccount` JWT in our deployment), not `SigV4`.
+/// The token file is re-read on every refresh because kubelet rotates it.
+///
+/// The resulting credentials are stored as a single container-credentials JSON
+/// blob (`{AccessKeyId, SecretAccessKey, Token, Expiration}`) that the sandbox
+/// emulator serves verbatim to the AWS SDK.
+async fn mint_aws_assume_role_with_web_identity(
+    state: &StoredProviderCredentialRefreshState,
+) -> Result<MintedCredential, Status> {
+    use openshell_core::aws;
+
+    let role_arn = required_material(&state.material, aws::ROLE_ARN_CONFIG_KEY)?;
+    let region = required_material(&state.material, aws::REGION_CONFIG_KEY)?;
+    let token_file = required_material(&state.material, aws::WEB_IDENTITY_TOKEN_FILE_CONFIG_KEY)?;
+    let session_name = material_value(&state.material, &[aws::SESSION_NAME_CONFIG_KEY])
+        .unwrap_or_else(|| "openshell".to_string());
+
+    if !is_valid_aws_region(&region) {
+        return Err(Status::invalid_argument(format!(
+            "invalid AWS region: {region}"
+        )));
+    }
+
+    let web_identity_token = tokio::fs::read_to_string(&token_file).await.map_err(|e| {
+        Status::failed_precondition(format!(
+            "read web identity token file '{token_file}' failed: {e}"
+        ))
+    })?;
+    let web_identity_token = web_identity_token.trim().to_string();
+    if web_identity_token.is_empty() {
+        return Err(Status::failed_precondition(
+            "web identity token file is empty",
+        ));
+    }
+
+    let duration_seconds = if state.max_lifetime_seconds > 0 {
+        state.max_lifetime_seconds.max(STS_MIN_DURATION_SECONDS)
+    } else {
+        DEFAULT_MAX_LIFETIME_SECONDS
+    };
+
+    // Regional STS endpoint avoids the legacy global endpoint and keeps the
+    // request inside the target region.
+    let sts_url = format!("https://sts.{region}.amazonaws.com/");
+    let form = vec![
+        (
+            "Action".to_string(),
+            "AssumeRoleWithWebIdentity".to_string(),
+        ),
+        ("Version".to_string(), "2011-06-15".to_string()),
+        ("RoleArn".to_string(), role_arn),
+        ("RoleSessionName".to_string(), session_name),
+        ("WebIdentityToken".to_string(), web_identity_token),
+        ("DurationSeconds".to_string(), duration_seconds.to_string()),
+    ];
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| Status::internal(format!("build STS HTTP client failed: {e}")))?;
+    let response = client
+        .post(&sts_url)
+        .form(&form)
+        .send()
+        .await
+        .map_err(|e| Status::unavailable(format!("STS request failed: {e}")))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| Status::unavailable(format!("read STS response failed: {e}")))?;
+    if !status.is_success() {
+        let detail = parse_sts_error(&body).map_or_else(
+            || format!("HTTP {status}"),
+            |(code, message)| format!("{code}: {message}"),
+        );
+        return Err(Status::failed_precondition(format!(
+            "AssumeRoleWithWebIdentity failed: {detail}"
+        )));
+    }
+
+    let creds = parse_sts_credentials(&body)?;
+    let blob = serde_json::to_string(&creds)
+        .map_err(|e| Status::internal(format!("serialize AWS credentials failed: {e}")))?;
+
+    let now_ms = current_time_ms();
+    Ok(MintedCredential {
+        access_token: blob,
+        expires_at_ms: now_ms.saturating_add(duration_seconds.saturating_mul(1000)),
+        refresh_token: None,
+    })
+}
+
+/// Extract the four credential fields from an `AssumeRoleWithWebIdentity`
+/// success response into the shared [`ContainerCredentials`] contract.
+///
+/// The STS response is a fixed, flat XML shape — the four values are plain text
+/// elements with no attributes, nested markup, or CDATA (secrets are base64 /
+/// ISO timestamps, none of which contain `<` or `>`), so a targeted tag
+/// extractor is sufficient and avoids a full XML dependency. Note STS names the
+/// token `<SessionToken>` while the container endpoint calls it `Token`.
+fn parse_sts_credentials(
+    xml: &str,
+) -> Result<openshell_core::aws::ContainerCredentials, Status> {
+    let field = |tag: &str| -> Result<String, Status> {
+        xml_tag_text(xml, tag)
+            .ok_or_else(|| Status::failed_precondition(format!("STS response missing <{tag}>")))
+    };
+    Ok(openshell_core::aws::ContainerCredentials {
+        access_key_id: field("AccessKeyId")?,
+        secret_access_key: field("SecretAccessKey")?,
+        token: field("SessionToken")?,
+        expiration: field("Expiration")?,
+    })
+}
+
+/// Extract `<Code>` and `<Message>` from an STS `<ErrorResponse>`.
+fn parse_sts_error(xml: &str) -> Option<(String, String)> {
+    let code = xml_tag_text(xml, "Code")?;
+    let message = xml_tag_text(xml, "Message").unwrap_or_default();
+    Some((code, message))
+}
+
+/// Return the text between the first `<tag>` and its matching `</tag>`.
+fn xml_tag_text(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    Some(xml[start..end].trim().to_string())
+}
+
+/// AWS region tokens are `[a-z0-9-]`. Validating before interpolating into the
+/// STS hostname prevents a malformed region from producing a surprising URL.
+fn is_valid_aws_region(region: &str) -> bool {
+    !region.is_empty()
+        && region
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 async fn request_token(
@@ -772,9 +927,10 @@ async fn run_refresh_worker_tick(store: &Store) -> Result<(), Status> {
 #[cfg(test)]
 mod tests {
     use super::{
-        NewRefreshStateConfig, get_refresh_state, new_refresh_state, put_refresh_state,
-        refresh_provider_credential, refresh_state_name, refresh_strategy_name,
-        run_refresh_worker_tick, seconds_until_ms,
+        NewRefreshStateConfig, get_refresh_state, is_valid_aws_region, new_refresh_state,
+        parse_sts_credentials, parse_sts_error, put_refresh_state, refresh_provider_credential,
+        refresh_state_name, refresh_strategy_name, run_refresh_worker_tick, seconds_until_ms,
+        xml_tag_text,
     };
     use crate::persistence::test_store;
     use openshell_core::ObjectId;
@@ -826,6 +982,69 @@ mod tests {
             "google_service_account_jwt"
         );
         assert_eq!(refresh_strategy_name(i32::MAX), "unspecified");
+    }
+
+    const STS_SUCCESS_XML: &str = r#"<AssumeRoleWithWebIdentityResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
+  <AssumeRoleWithWebIdentityResult>
+    <Credentials>
+      <AccessKeyId>ASIAEXAMPLE</AccessKeyId>
+      <SecretAccessKey>wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY</SecretAccessKey>
+      <SessionToken>FQoGZXIvYXdzEEXAMPLETOKEN==</SessionToken>
+      <Expiration>2026-06-24T12:00:00Z</Expiration>
+    </Credentials>
+    <SubjectFromWebIdentityToken>system:serviceaccount:ns:sa</SubjectFromWebIdentityToken>
+  </AssumeRoleWithWebIdentityResult>
+</AssumeRoleWithWebIdentityResponse>"#;
+
+    const STS_ERROR_XML: &str = r#"<ErrorResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
+  <Error>
+    <Type>Sender</Type>
+    <Code>InvalidIdentityToken</Code>
+    <Message>The web identity token that was passed could not be validated.</Message>
+  </Error>
+  <RequestId>abc-123</RequestId>
+</ErrorResponse>"#;
+
+    #[test]
+    fn parse_sts_credentials_extracts_all_fields() {
+        let creds = parse_sts_credentials(STS_SUCCESS_XML).expect("parse");
+        assert_eq!(creds.access_key_id, "ASIAEXAMPLE");
+        assert_eq!(
+            creds.secret_access_key,
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        );
+        assert_eq!(creds.token, "FQoGZXIvYXdzEEXAMPLETOKEN==");
+        assert_eq!(creds.expiration, "2026-06-24T12:00:00Z");
+    }
+
+    #[test]
+    fn parse_sts_credentials_errors_on_missing_field() {
+        let xml = "<AssumeRoleWithWebIdentityResult><Credentials></Credentials></AssumeRoleWithWebIdentityResult>";
+        let err = parse_sts_credentials(xml).expect_err("should fail");
+        assert!(err.message().contains("missing <AccessKeyId>"));
+    }
+
+    #[test]
+    fn parse_sts_error_extracts_code_and_message() {
+        let (code, message) = parse_sts_error(STS_ERROR_XML).expect("parse error");
+        assert_eq!(code, "InvalidIdentityToken");
+        assert!(message.contains("could not be validated"));
+    }
+
+    #[test]
+    fn xml_tag_text_handles_missing_tag() {
+        assert_eq!(xml_tag_text("<a>x</a>", "b"), None);
+        assert_eq!(xml_tag_text("<a>x</a>", "a"), Some("x".to_string()));
+    }
+
+    #[test]
+    fn is_valid_aws_region_accepts_canonical_and_rejects_garbage() {
+        assert!(is_valid_aws_region("us-east-1"));
+        assert!(is_valid_aws_region("ap-southeast-2"));
+        assert!(!is_valid_aws_region(""));
+        assert!(!is_valid_aws_region("us_east_1"));
+        assert!(!is_valid_aws_region("US-EAST-1"));
+        assert!(!is_valid_aws_region("evil.com/path"));
     }
 
     #[tokio::test]
