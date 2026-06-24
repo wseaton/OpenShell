@@ -1,0 +1,127 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "AWS"
+sidebar-title: "AWS"
+description: "Authenticate with AWS APIs inside OpenShell sandboxes."
+keywords: "AWS, S3, STS, Web Identity, IRSA, Credentials, Sandbox, SigV4"
+---
+
+The `aws` provider gives sandboxes native AWS credentials so any AWS SDK works
+out of the box — S3, and any other service the assumed role can reach. The
+gateway runs `AssumeRoleWithWebIdentity` and refreshes the resulting short-lived
+STS credentials. A container-credentials emulator on loopback serves them to the
+AWS SDK, so SigV4 signing happens locally with no static keys on the sandbox
+filesystem.
+
+This differs from the `google-cloud` provider in one important way. AWS SigV4
+signs requests inside the sandbox, so there is no bearer token for the proxy to
+swap in at egress. The emulator therefore serves the **real** temporary
+credentials (short-lived and role-scoped), not placeholders. Scope the role
+tightly and keep the credential lifetime short.
+
+## Quick Start
+
+Point the gateway at an IAM role and a web-identity token file (for example a
+projected Kubernetes ServiceAccount token mounted in the gateway pod):
+
+```shell
+openshell provider create \
+  --name my-aws \
+  --type aws \
+  --role-arn arn:aws:iam::123456789012:role/my-sandbox-role \
+  --web-identity-token-file /var/run/secrets/aws/token \
+  --region us-east-1
+```
+
+`--role-arn` configures the `aws-assume-role-with-web-identity` refresh strategy
+on the gateway and mints the first set of temporary credentials before the
+command returns. The gateway re-reads the token file (kubelet rotates it) and
+refreshes the credentials automatically — no manual refresh needed.
+
+## How It Works
+
+When a sandbox starts with the `aws` provider attached:
+
+1. The gateway reads the web-identity token file and calls STS
+   `AssumeRoleWithWebIdentity` (an unsigned call authenticated by the token, not
+   by AWS keys), then stores the temporary credentials in the sandbox proxy's
+   credential resolver.
+2. A loopback HTTP server on `127.0.0.1:8175` emulates the ECS/EKS
+   container-credentials endpoint. The AWS SDK discovers it via
+   `AWS_CONTAINER_CREDENTIALS_FULL_URI` and fetches the real temporary
+   credentials, which it uses to sign requests locally.
+3. When the credentials approach expiry, the gateway refreshes them. The
+   resolver is updated atomically — subsequent SDK calls fetch the new
+   credentials automatically.
+
+The static credential environment variables (`AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`) are deliberately **not** set in the
+sandbox, so the SDK falls through to the container-credentials endpoint instead
+of reading a placeholder.
+
+### Configuration Keys
+
+Provide these via the `--role-arn`, `--web-identity-token-file`, `--region`, and
+`--session-name` flags:
+
+| Key | Description | Example |
+|-----|-------------|---------|
+| `role_arn` | IAM role ARN to assume via web identity | `arn:aws:iam::123456789012:role/my-role` |
+| `web_identity_token_file` | Path to the web-identity token file the gateway reads | `/var/run/secrets/aws/token` |
+| `region` | AWS region for the STS endpoint and the SDK | `us-east-1` |
+| `session_name` | STS role session name (optional) | `openshell` |
+
+### Injected Environment Variables
+
+| Variable | Value | Purpose |
+|----------|-------|---------|
+| `AWS_CONTAINER_CREDENTIALS_FULL_URI` | `http://127.0.0.1:8175/creds` | AWS SDK credential discovery (loopback server) |
+| `AWS_REGION` | from `region` config | AWS region |
+| `AWS_DEFAULT_REGION` | from `region` config | Alternative region var |
+
+## Using with AWS APIs
+
+Add the target AWS service hosts to your sandbox network policy:
+
+```yaml
+network_policies:
+  aws_apis:
+    name: aws-apis
+    endpoints:
+      - host: "*.amazonaws.com"
+        port: 443
+        protocol: rest
+        access: read-write
+        enforcement: enforce
+    binaries:
+      - { path: /usr/bin/curl }
+      - { path: "/sandbox/.uv/python/**" }
+      - { path: "/sandbox/.venv/**" }
+```
+
+Or update a live sandbox directly:
+
+```shell
+openshell policy update my-sandbox \
+  --add-endpoint "*.amazonaws.com:443:read-write:rest:enforce" \
+  --binary "/usr/bin/curl" \
+  --binary "/sandbox/.uv/python/**" \
+  --binary "/sandbox/.venv/**" \
+  --wait
+```
+
+## Network Policy
+
+The `aws` provider type does not include any network policy endpoints by
+default. Add endpoint rules to your sandbox policy for each AWS service the
+sandbox needs to reach. See "Using with AWS APIs" above for an example.
+
+## IAM Role Trust Policy
+
+The assumed role's trust policy must permit `sts:AssumeRoleWithWebIdentity` for
+the identity provider that issued the web-identity token, with `sub` and `aud`
+conditions matching the token. For a projected Kubernetes ServiceAccount token,
+the audience is typically `sts.amazonaws.com`. Scope the role's permission
+policy to only the resources the sandbox needs (for example a single S3 bucket
+and prefix) to limit the blast radius of the short-lived credentials.

@@ -81,6 +81,16 @@ server inside the network namespace serves placeholders to SDKs that bypass the
 proxy (e.g. Go's `cloud.google.com/go/compute/metadata`). Secrets must not be
 logged in OCSF or plain tracing output.
 
+AWS providers work differently because SigV4 signs requests inside the sandbox,
+so there is no bearer token for the proxy to swap in at egress. The gateway runs
+`AssumeRoleWithWebIdentity` and refreshes the temporary credentials; a loopback
+container-credentials emulator inside the network namespace serves the **real**
+credentials to the AWS SDK via `AWS_CONTAINER_CREDENTIALS_FULL_URI`. The static
+credential environment variables are stripped from the child env so the SDK
+falls through to the emulator instead of reading a placeholder. The
+gateway-to-emulator payload is the shared `openshell_core::aws::ContainerCredentials`
+type.
+
 Provider profiles can also declare dynamic token grants. For matching HTTP
 endpoints, the supervisor obtains a SPIFFE JWT-SVID from the local Workload API,
 exchanges it for an OAuth2 access token, caches the token, and injects it as an

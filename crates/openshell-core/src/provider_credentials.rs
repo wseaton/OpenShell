@@ -113,56 +113,43 @@ impl ProviderCredentialState {
     ///    here so SDKs can read them at startup.
     /// 3. Everything else stays as placeholders for proxy-time resolution.
     pub fn child_env_with_gcp_resolved(&self) -> HashMap<String, String> {
-        use crate::google_cloud;
-
         let inner = self
             .inner
             .read()
             .expect("provider credential state poisoned");
         let mut env = inner.current.child_env.clone();
-
-        let has_gcp_metadata = env.contains_key("GCE_METADATA_HOST");
-        let has_gcp_config = google_cloud::STATIC_CONFIG_KEYS
-            .iter()
-            .any(|k| env.contains_key(*k));
-
-        if !has_gcp_metadata && !has_gcp_config {
-            return env;
-        }
-
-        if has_gcp_metadata {
-            // Synthetic vars: sandbox-internal config that doesn't originate
-            // from user input and was never placeholderized.
-            env.insert(
-                "GCE_METADATA_HOST".to_string(),
-                google_cloud::METADATA_LOOPBACK_ADDR.to_string(),
-            );
-            // Python's google-auth builds its ping URL as http://{GCE_METADATA_IP}
-            // so the value must include the port.
-            env.insert(
-                "GCE_METADATA_IP".to_string(),
-                google_cloud::METADATA_LOOPBACK_ADDR.to_string(),
-            );
-            // Node.js gcp-metadata uses METADATA_SERVER_DETECTION to skip the
-            // runtime ping that otherwise fails in sandboxed environments.
-            env.insert(
-                "METADATA_SERVER_DETECTION".to_string(),
-                "assume-present".to_string(),
-            );
-        }
-
-        // Un-placeholderize non-secret config vars so SDKs can read them
-        // at process startup before any HTTP flows through the proxy.
-        if let Some(ref resolver) = inner.combined_resolver {
-            for key in google_cloud::STATIC_CONFIG_KEYS {
-                let placeholder = crate::secrets::placeholder_for_env_key(key);
-                if let Some(value) = resolver.resolve_placeholder(&placeholder) {
-                    env.insert(key.to_string(), value.to_string());
-                }
-            }
-        }
-
+        apply_gcp_resolution(&mut env, inner.combined_resolver.as_ref());
         env
+    }
+
+    /// Return `child_env` with both GCP and AWS provider vars resolved.
+    ///
+    /// Applied before the child process and SSH sessions start. GCP and AWS
+    /// resolution are independent; whichever provider is attached takes effect.
+    pub fn child_env_resolved(&self) -> HashMap<String, String> {
+        let inner = self
+            .inner
+            .read()
+            .expect("provider credential state poisoned");
+        let mut env = inner.current.child_env.clone();
+        apply_gcp_resolution(&mut env, inner.combined_resolver.as_ref());
+        apply_aws_resolution(&mut env, inner.combined_resolver.as_ref());
+        env
+    }
+
+    /// Resolve the gateway-minted STS credentials JSON blob to its real value.
+    ///
+    /// Returns the container-credentials JSON string
+    /// (`{AccessKeyId, SecretAccessKey, SessionToken, Expiration}`) held by the
+    /// `SecretResolver`, or `None` if no AWS credentials are configured. The
+    /// AWS container-credentials emulator calls this to serve real temp creds
+    /// (unlike GCP, which serves placeholders resolved at egress).
+    pub fn aws_credentials_json(&self) -> Option<String> {
+        let resolver = self.resolver()?;
+        let placeholder = crate::secrets::placeholder_for_env_key(crate::aws::CREDENTIALS_JSON_ENV);
+        resolver
+            .resolve_placeholder(&placeholder)
+            .map(str::to_string)
     }
 
     /// Return the GCP token placeholder and its remaining lifetime in seconds.
@@ -236,6 +223,91 @@ impl ProviderCredentialState {
         inner.combined_resolver =
             merge_resolvers(&inner.generations, inner.current_resolver.as_ref());
         inner.current.child_env.len()
+    }
+}
+
+/// Resolve GCP static config vars in place and point the metadata host at the
+/// loopback emulator. No-op when no GCP provider is attached.
+fn apply_gcp_resolution(env: &mut HashMap<String, String>, resolver: Option<&Arc<SecretResolver>>) {
+    use crate::google_cloud;
+
+    let has_gcp_metadata = env.contains_key("GCE_METADATA_HOST");
+    let has_gcp_config = google_cloud::STATIC_CONFIG_KEYS
+        .iter()
+        .any(|k| env.contains_key(*k));
+
+    if !has_gcp_metadata && !has_gcp_config {
+        return;
+    }
+
+    if has_gcp_metadata {
+        // Synthetic vars: sandbox-internal config that doesn't originate
+        // from user input and was never placeholderized.
+        env.insert(
+            "GCE_METADATA_HOST".to_string(),
+            google_cloud::METADATA_LOOPBACK_ADDR.to_string(),
+        );
+        // Python's google-auth builds its ping URL as http://{GCE_METADATA_IP}
+        // so the value must include the port.
+        env.insert(
+            "GCE_METADATA_IP".to_string(),
+            google_cloud::METADATA_LOOPBACK_ADDR.to_string(),
+        );
+        // Node.js gcp-metadata uses METADATA_SERVER_DETECTION to skip the
+        // runtime ping that otherwise fails in sandboxed environments.
+        env.insert(
+            "METADATA_SERVER_DETECTION".to_string(),
+            "assume-present".to_string(),
+        );
+    }
+
+    // Un-placeholderize non-secret config vars so SDKs can read them
+    // at process startup before any HTTP flows through the proxy.
+    if let Some(resolver) = resolver {
+        for key in google_cloud::STATIC_CONFIG_KEYS {
+            let placeholder = crate::secrets::placeholder_for_env_key(key);
+            if let Some(value) = resolver.resolve_placeholder(&placeholder) {
+                env.insert(key.to_string(), value.to_string());
+            }
+        }
+    }
+}
+
+/// Resolve AWS provider vars in place for the container-credentials emulator.
+///
+/// When the AWS provider was injected (`AWS_CONTAINER_CREDENTIALS_FULL_URI`
+/// present), this:
+/// 1. Rewrites the full-URI env var to the loopback emulator URI.
+/// 2. Un-placeholderizes the non-secret region vars for SDK startup.
+/// 3. Strips the internal STS JSON blob and any static credential vars so the
+///    SDK falls through to the container endpoint instead of signing with a
+///    placeholder string. The blob remains resolvable via the `SecretResolver`
+///    for the emulator only (see [`ProviderCredentialState::aws_credentials_json`]).
+///
+/// No-op when no AWS provider is attached.
+fn apply_aws_resolution(env: &mut HashMap<String, String>, resolver: Option<&Arc<SecretResolver>>) {
+    use crate::aws;
+
+    if !env.contains_key(aws::CONTAINER_CREDS_FULL_URI_ENV) {
+        return;
+    }
+
+    env.insert(
+        aws::CONTAINER_CREDS_FULL_URI_ENV.to_string(),
+        aws::CONTAINER_CREDS_FULL_URI.to_string(),
+    );
+
+    if let Some(resolver) = resolver {
+        for key in aws::STATIC_CONFIG_KEYS {
+            let placeholder = crate::secrets::placeholder_for_env_key(key);
+            if let Some(value) = resolver.resolve_placeholder(&placeholder) {
+                env.insert(key.to_string(), value.to_string());
+            }
+        }
+    }
+
+    for key in aws::CHILD_ENV_KEYS_TO_STRIP {
+        env.remove(*key);
     }
 }
 
@@ -563,6 +635,79 @@ mod tests {
             !env.contains_key("GCE_METADATA_IP"),
             "metadata synthetic vars should not be injected without GCE_METADATA_HOST"
         );
+    }
+
+    #[test]
+    fn aws_resolution_strips_creds_and_points_uri_at_loopback() {
+        use crate::aws;
+        let state = ProviderCredentialState::from_environment(
+            1,
+            HashMap::from([
+                (
+                    aws::CONTAINER_CREDS_FULL_URI_ENV.to_string(),
+                    aws::METADATA_HOST.to_string(),
+                ),
+                (
+                    aws::CREDENTIALS_JSON_ENV.to_string(),
+                    r#"{"AccessKeyId":"AKIA","SecretAccessKey":"secret"}"#.to_string(),
+                ),
+                ("AWS_REGION".to_string(), "us-east-1".to_string()),
+                ("AWS_ACCESS_KEY_ID".to_string(), "leaked".to_string()),
+            ]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let env = state.child_env_resolved();
+
+        assert_eq!(
+            env.get(aws::CONTAINER_CREDS_FULL_URI_ENV)
+                .map(String::as_str),
+            Some(aws::CONTAINER_CREDS_FULL_URI),
+            "full URI should point at the loopback emulator"
+        );
+        assert_eq!(
+            env.get("AWS_REGION").map(String::as_str),
+            Some("us-east-1"),
+            "region should resolve to its real value"
+        );
+        assert!(
+            !env.contains_key(aws::CREDENTIALS_JSON_ENV),
+            "internal STS blob must be stripped from child env"
+        );
+        assert!(
+            !env.contains_key("AWS_ACCESS_KEY_ID"),
+            "static creds must be stripped so the SDK uses the container endpoint"
+        );
+    }
+
+    #[test]
+    fn aws_resolution_noop_without_provider() {
+        let state = ProviderCredentialState::from_environment(
+            1,
+            HashMap::from([("GITHUB_TOKEN".to_string(), "ghp_abc".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let env = state.child_env_resolved();
+        assert_eq!(
+            env.get("GITHUB_TOKEN").map(String::as_str),
+            Some("openshell:resolve:env:v1_GITHUB_TOKEN"),
+            "non-AWS env should remain a placeholder"
+        );
+        assert!(state.aws_credentials_json().is_none());
+    }
+
+    #[test]
+    fn aws_credentials_json_resolves_real_blob() {
+        use crate::aws;
+        let blob = r#"{"AccessKeyId":"AKIA","SecretAccessKey":"s","SessionToken":"t"}"#;
+        let state = ProviderCredentialState::from_environment(
+            1,
+            HashMap::from([(aws::CREDENTIALS_JSON_ENV.to_string(), blob.to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        assert_eq!(state.aws_credentials_json().as_deref(), Some(blob));
     }
 
     #[test]

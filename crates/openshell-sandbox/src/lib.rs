@@ -6,6 +6,8 @@
 //! This crate provides process sandboxing and monitoring capabilities.
 
 mod activity_aggregator;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod aws_metadata;
 mod denial_aggregator;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod google_cloud_metadata;
@@ -201,7 +203,7 @@ pub async fn run_sandbox(
         dynamic_credentials,
     );
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-    let mut provider_env = provider_credentials.child_env_with_gcp_resolved();
+    let mut provider_env = provider_credentials.child_env_resolved();
 
     // Initialize the agent-proposals feature flag. Default false until the
     // initial settings fetch (or the poll loop) tells us otherwise. The flag
@@ -440,6 +442,45 @@ pub async fn run_sandbox(
                 provider_env.remove("GCE_METADATA_IP");
                 provider_env.remove("METADATA_SERVER_DETECTION");
                 provider_credentials.remove_env_key("GCE_METADATA_HOST");
+            }
+        }
+    }
+
+    // Start the AWS container-credentials loopback server inside the network
+    // namespace. The AWS SDK reaches it via AWS_CONTAINER_CREDENTIALS_FULL_URI
+    // (loopback), so it does not go through HTTP_PROXY. Must start before the
+    // process leaf so SSH sessions see corrected env vars on bind failure.
+    #[cfg(target_os = "linux")]
+    if let Some(ns) = netns.as_ref()
+        && provider_credentials
+            .snapshot()
+            .child_env
+            .contains_key(openshell_core::aws::CONTAINER_CREDS_FULL_URI_ENV)
+    {
+        let ctx = aws_metadata::AwsMetadataContext::new(provider_credentials.clone());
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        match ns
+            .bind_tcp_in_netns(openshell_core::aws::CONTAINER_CREDS_LOOPBACK_ADDR)
+            .await
+        {
+            Ok(listener) => {
+                tokio::spawn(metadata_server::run(listener, ctx, ready_tx));
+                if let Ok(Ok(addr)) = timeout(Duration::from_secs(5), ready_rx).await {
+                    info!(addr = %addr, "AWS container-credentials server ready");
+                } else {
+                    warn!(
+                        "AWS container-credentials server failed to become ready, removing env var"
+                    );
+                    provider_env.remove(openshell_core::aws::CONTAINER_CREDS_FULL_URI_ENV);
+                    provider_credentials
+                        .remove_env_key(openshell_core::aws::CONTAINER_CREDS_FULL_URI_ENV);
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "AWS container-credentials server bind failed, AWS SDK may not discover credentials");
+                provider_env.remove(openshell_core::aws::CONTAINER_CREDS_FULL_URI_ENV);
+                provider_credentials
+                    .remove_env_key(openshell_core::aws::CONTAINER_CREDS_FULL_URI_ENV);
             }
         }
     }

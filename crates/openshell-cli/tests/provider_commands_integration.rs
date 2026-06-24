@@ -1263,6 +1263,7 @@ async fn provider_create_allows_empty_credentials_for_gateway_refresh_profiles()
         &[],
         false,
         true,
+        &run::AwsWebIdentityOptions::default(),
         &[],
         &ts.tls,
     )

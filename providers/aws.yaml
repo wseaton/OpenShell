@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: aws
+display_name: AWS (temporary credentials)
+description: |
+  Native AWS SDK credentials for sandboxes via a container-credentials
+  emulator. The gateway runs AssumeRoleWithWebIdentity with a web-identity
+  token (e.g. a projected Kubernetes ServiceAccount token mounted in the outer
+  pod) and refreshes the resulting short-lived STS credentials. Inside the
+  sandbox, a loopback emulator serves them to the AWS SDK via
+  AWS_CONTAINER_CREDENTIALS_FULL_URI, so SigV4 signing works locally with no
+  static keys on the sandbox filesystem.
+category: other
+inference_capable: false
+
+credentials:
+  # Gateway-minted STS credentials, stored as a single JSON blob
+  # ({AccessKeyId, SecretAccessKey, SessionToken, Expiration}) and served by
+  # the sandbox container-credentials emulator. Not injected as a request
+  # header — AWS signs locally, so there is no bearer token to rewrite.
+  - name: temp_credentials
+    description: Short-lived STS credentials from AssumeRoleWithWebIdentity
+    env_vars: [AWS_CONTAINER_CREDENTIALS_JSON]
+    required: false
+    refresh:
+      strategy: aws_assume_role_with_web_identity
+      refresh_before_seconds: 300
+      max_lifetime_seconds: 3600
+      material:
+        - name: role_arn
+          description: ARN of the IAM role to assume via web identity
+          required: true
+        - name: web_identity_token_file
+          description: Path to the web-identity token file the gateway reads (and re-reads on refresh)
+          required: true
+        - name: region
+          description: AWS region for the regional STS endpoint
+          required: true
+        - name: session_name
+          description: STS role session name (optional)
+
+discovery:
+  # Credentials are gateway-minted, never discovered from the local
+  # environment, so `--from-existing` does not scan for them.
+  credentials: []
+
+# No endpoints: selecting `aws` does not implicitly grant S3 egress. Add the
+# AWS service hosts you need (e.g. `*.amazonaws.com:443`) to your sandbox
+# network policy, mirroring the google-cloud provider.
+endpoints: []
+binaries: []

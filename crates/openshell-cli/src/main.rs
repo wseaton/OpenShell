@@ -747,7 +747,7 @@ impl From<CliEditor> for openshell_cli::ssh::Editor {
 #[derive(Subcommand, Debug)]
 enum ProviderCommands {
     /// Create a provider config.
-    #[command(group = clap::ArgGroup::new("cred_source").required(true).args(["from_existing", "credentials", "from_gcloud_adc", "runtime_credentials"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    #[command(group = clap::ArgGroup::new("cred_source").required(true).args(["from_existing", "credentials", "from_gcloud_adc", "runtime_credentials", "role_arn"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Create {
         /// Provider name.
         #[arg(long)]
@@ -778,6 +778,23 @@ enum ProviderCommands {
         /// Create a provider whose required credentials are resolved at runtime by the gateway/sandbox.
         #[arg(long, conflicts_with_all = ["from_existing", "credentials", "from_gcloud_adc"])]
         runtime_credentials: bool,
+
+        /// AWS: IAM role ARN to assume via web identity (use with `--type aws`).
+        /// The gateway runs `AssumeRoleWithWebIdentity` and refreshes the temp creds.
+        #[arg(long, conflicts_with_all = ["from_existing", "credentials", "from_gcloud_adc", "runtime_credentials"])]
+        role_arn: Option<String>,
+
+        /// AWS: path to the web-identity token file the gateway reads (and re-reads on refresh).
+        #[arg(long, requires = "role_arn")]
+        web_identity_token_file: Option<String>,
+
+        /// AWS: region for the STS endpoint and the sandbox AWS SDK.
+        #[arg(long, requires = "role_arn")]
+        region: Option<String>,
+
+        /// AWS: STS role session name (optional).
+        #[arg(long, requires = "role_arn")]
+        session_name: Option<String>,
 
         /// Provider config key/value pair.
         #[arg(long = "config", value_name = "KEY=VALUE")]
@@ -2881,6 +2898,10 @@ async fn main() -> Result<()> {
                     credentials,
                     from_gcloud_adc,
                     runtime_credentials,
+                    role_arn,
+                    web_identity_token_file,
+                    region,
+                    session_name,
                     config,
                 } => {
                     run::provider_create_with_options(
@@ -2891,6 +2912,12 @@ async fn main() -> Result<()> {
                         &credentials,
                         from_gcloud_adc,
                         runtime_credentials,
+                        &run::AwsWebIdentityOptions {
+                            role_arn,
+                            web_identity_token_file,
+                            region,
+                            session_name,
+                        },
                         &config,
                         &tls,
                     )
@@ -4145,6 +4172,89 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("--credential"));
         assert!(msg.contains("--from-gcloud-adc"));
+    }
+
+    #[test]
+    fn provider_create_accepts_aws_web_identity() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "create",
+            "--name",
+            "ci-aws",
+            "--type",
+            "aws",
+            "--role-arn",
+            "arn:aws:iam::123456789012:role/ci",
+            "--web-identity-token-file",
+            "/var/run/secrets/aws/token",
+            "--region",
+            "us-east-1",
+        ])
+        .expect("aws web-identity create should parse");
+
+        match cli.command {
+            Some(Commands::Provider {
+                command:
+                    Some(ProviderCommands::Create {
+                        role_arn,
+                        web_identity_token_file,
+                        region,
+                        ..
+                    }),
+            }) => {
+                assert_eq!(
+                    role_arn.as_deref(),
+                    Some("arn:aws:iam::123456789012:role/ci")
+                );
+                assert_eq!(
+                    web_identity_token_file.as_deref(),
+                    Some("/var/run/secrets/aws/token")
+                );
+                assert_eq!(region.as_deref(), Some("us-east-1"));
+            }
+            other => panic!("expected provider create command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_create_rejects_web_identity_token_file_without_role_arn() {
+        let err = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "create",
+            "--name",
+            "ci-aws",
+            "--type",
+            "aws",
+            "--web-identity-token-file",
+            "/var/run/secrets/aws/token",
+        ])
+        .expect_err("clap should require --role-arn for --web-identity-token-file");
+
+        assert!(err.to_string().contains("--role-arn"));
+    }
+
+    #[test]
+    fn provider_create_rejects_role_arn_with_credential() {
+        let err = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "create",
+            "--name",
+            "ci-aws",
+            "--type",
+            "aws",
+            "--role-arn",
+            "arn:aws:iam::123456789012:role/ci",
+            "--credential",
+            "AWS_CONTAINER_CREDENTIALS_JSON=blob",
+        ])
+        .expect_err("clap should reject conflicting credential sources");
+
+        let msg = err.to_string();
+        assert!(msg.contains("--credential"));
+        assert!(msg.contains("--role-arn"));
     }
 
     #[test]

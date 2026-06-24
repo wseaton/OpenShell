@@ -4348,10 +4348,11 @@ fn read_gcloud_adc() -> Result<(String, String, String)> {
     Ok((client_id, client_secret, refresh_token))
 }
 
-async fn rollback_provider_create_after_gcloud_adc_failure(
+async fn rollback_provider_create_after_bootstrap_failure(
     client: &mut crate::tls::GrpcClient,
     provider_name: &str,
     stage: &str,
+    source_label: &str,
     source: &Status,
 ) -> Result<()> {
     match client
@@ -4361,7 +4362,7 @@ async fn rollback_provider_create_after_gcloud_adc_failure(
         .await
     {
         Ok(_) => Err(miette!(
-            "failed to {stage} credentials from gcloud ADC for provider '{provider_name}': {source}. \
+            "failed to {stage} credentials from {source_label} for provider '{provider_name}': {source}. \
              The provider was rolled back successfully."
         )),
         Err(cleanup_err) => {
@@ -4375,7 +4376,7 @@ async fn rollback_provider_create_after_gcloud_adc_failure(
                 provider_name
             );
             Err(miette!(
-                "failed to {stage} credentials from gcloud ADC for provider '{provider_name}': {source}. \
+                "failed to {stage} credentials from {source_label} for provider '{provider_name}': {source}. \
                  Cleanup also failed, so the provider may still exist. \
                  Run 'openshell provider delete {provider_name}' to remove it manually."
             ))
@@ -4513,6 +4514,20 @@ fn missing_credentials_error(provider_type: &str) -> miette::Report {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// AWS web-identity provider bootstrap options (mirrors `--from-gcloud-adc`).
+///
+/// When `role_arn` is set, `provider_create_with_options` configures the
+/// `aws_assume_role_with_web_identity` refresh strategy and mints the first set
+/// of temp credentials, so the provider works immediately.
+#[derive(Default, Debug, Clone)]
+pub struct AwsWebIdentityOptions {
+    pub role_arn: Option<String>,
+    pub web_identity_token_file: Option<String>,
+    pub region: Option<String>,
+    pub session_name: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn provider_create(
     server: &str,
     name: &str,
@@ -4531,6 +4546,7 @@ pub async fn provider_create(
         credentials,
         from_gcloud_adc,
         false,
+        &AwsWebIdentityOptions::default(),
         config,
         tls,
     )
@@ -4546,9 +4562,11 @@ pub async fn provider_create_with_options(
     credentials: &[String],
     from_gcloud_adc: bool,
     runtime_credentials: bool,
+    aws: &AwsWebIdentityOptions,
     config: &[String],
     tls: &TlsOptions,
 ) -> Result<()> {
+    let aws_web_identity = aws.role_arn.is_some();
     if from_gcloud_adc && (from_existing || !credentials.is_empty() || runtime_credentials) {
         return Err(miette::miette!(
             "--from-gcloud-adc cannot be combined with --from-existing or --credential; it also cannot be combined with --runtime-credentials"
@@ -4647,7 +4665,7 @@ pub async fn provider_create_with_options(
         if from_existing {
             return Err(missing_credentials_error(&provider_type));
         }
-        if !from_gcloud_adc && !runtime_credentials {
+        if !from_gcloud_adc && !runtime_credentials && !aws_web_identity {
             return Err(missing_credentials_error(&provider_type));
         }
         let allows_empty_credentials = if runtime_credentials {
@@ -4728,10 +4746,11 @@ pub async fn provider_create_with_options(
             })
             .await
         {
-            return rollback_provider_create_after_gcloud_adc_failure(
+            return rollback_provider_create_after_bootstrap_failure(
                 &mut client,
                 &provider_name,
                 "configure",
+                "gcloud ADC",
                 &configure_err,
             )
             .await;
@@ -4744,10 +4763,11 @@ pub async fn provider_create_with_options(
             })
             .await
         {
-            return rollback_provider_create_after_gcloud_adc_failure(
+            return rollback_provider_create_after_bootstrap_failure(
                 &mut client,
                 &provider_name,
                 "mint the initial access token for",
+                "gcloud ADC",
                 &rotate_err,
             )
             .await;
@@ -4755,6 +4775,86 @@ pub async fn provider_create_with_options(
 
         println!("{} Created provider {}", "✓".green().bold(), provider_name);
         println!("Configured GCP credentials from gcloud ADC and minted the initial access token");
+        return Ok(());
+    }
+
+    if aws_web_identity {
+        let role_arn = aws
+            .role_arn
+            .clone()
+            .expect("role_arn set when aws_web_identity is true");
+        let token_file = aws.web_identity_token_file.clone().ok_or_else(|| {
+            miette::miette!("--web-identity-token-file is required with --role-arn")
+        })?;
+        let region = aws
+            .region
+            .clone()
+            .ok_or_else(|| miette::miette!("--region is required with --role-arn"))?;
+
+        let mut material = HashMap::from([
+            (
+                openshell_core::aws::ROLE_ARN_CONFIG_KEY.to_string(),
+                role_arn,
+            ),
+            (
+                openshell_core::aws::WEB_IDENTITY_TOKEN_FILE_CONFIG_KEY.to_string(),
+                token_file,
+            ),
+            (openshell_core::aws::REGION_CONFIG_KEY.to_string(), region),
+        ]);
+        if let Some(session_name) = aws.session_name.clone().filter(|s| !s.trim().is_empty()) {
+            material.insert(
+                openshell_core::aws::SESSION_NAME_CONFIG_KEY.to_string(),
+                session_name,
+            );
+        }
+
+        let credential_key = openshell_core::aws::CREDENTIALS_JSON_ENV.to_string();
+
+        if let Err(configure_err) = client
+            .configure_provider_refresh(ConfigureProviderRefreshRequest {
+                provider: provider_name.clone(),
+                credential_key: credential_key.clone(),
+                strategy: ProviderCredentialRefreshStrategy::AwsAssumeRoleWithWebIdentity as i32,
+                material,
+                // The token file holds a secret, but we store only its path; no
+                // material value is itself a secret.
+                secret_material_keys: vec![],
+                expires_at_ms: None,
+            })
+            .await
+        {
+            return rollback_provider_create_after_bootstrap_failure(
+                &mut client,
+                &provider_name,
+                "configure",
+                "AWS web identity",
+                &configure_err,
+            )
+            .await;
+        }
+
+        if let Err(rotate_err) = client
+            .rotate_provider_credential(RotateProviderCredentialRequest {
+                provider: provider_name.clone(),
+                credential_key,
+            })
+            .await
+        {
+            return rollback_provider_create_after_bootstrap_failure(
+                &mut client,
+                &provider_name,
+                "mint the initial credentials for",
+                "AWS web identity",
+                &rotate_err,
+            )
+            .await;
+        }
+
+        println!("{} Created provider {}", "✓".green().bold(), provider_name);
+        println!(
+            "Configured AWS web-identity credentials and minted the initial temporary credentials"
+        );
         return Ok(());
     }
 
@@ -5317,6 +5417,9 @@ fn provider_refresh_strategy(strategy: &str) -> Result<ProviderCredentialRefresh
         "google_service_account_jwt" => {
             Ok(ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt)
         }
+        "aws_assume_role_with_web_identity" => {
+            Ok(ProviderCredentialRefreshStrategy::AwsAssumeRoleWithWebIdentity)
+        }
         _ => Err(miette!("unsupported provider refresh strategy: {strategy}")),
     }
 }
@@ -5369,6 +5472,9 @@ fn provider_refresh_strategy_name(strategy: ProviderCredentialRefreshStrategy) -
         ProviderCredentialRefreshStrategy::Oauth2RefreshToken => "oauth2_refresh_token",
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
+        ProviderCredentialRefreshStrategy::AwsAssumeRoleWithWebIdentity => {
+            "aws_assume_role_with_web_identity"
+        }
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
 }
