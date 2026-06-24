@@ -12,6 +12,13 @@ One value is intentionally NOT rendered here:
                                  when server.externalDbSecret is set, otherwise
                                  --db-url arg for SQLite
 */}}
+{{- $credentialDrivers := list -}}
+{{- if .Values.server.credentialDrivers.kubernetesSecrets.enabled -}}
+{{- $credentialDrivers = append $credentialDrivers "kubernetes-secrets" -}}
+{{- end -}}
+{{- if .Values.server.credentialDrivers.openbao.enabled -}}
+{{- $credentialDrivers = append $credentialDrivers "openbao" -}}
+{{- end -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -32,6 +39,9 @@ data:
     metrics_bind_address  = "0.0.0.0:{{ .Values.service.metricsPort }}"
     {{- end }}
     log_level             = {{ .Values.server.logLevel | quote }}
+    {{- if $credentialDrivers }}
+    credential_drivers    = [{{- range $i, $driver := $credentialDrivers }}{{ if $i }}, {{ end }}{{ $driver | quote }}{{- end }}]
+    {{- end }}
     sandbox_namespace     = {{ include "openshell.sandboxNamespace" . | quote }}
     default_image         = {{ .Values.server.sandboxImage | quote }}
     supervisor_image      = {{ include "openshell.supervisorImage" . | quote }}
@@ -140,4 +150,41 @@ data:
     {{- end }}
     {{- if .Values.supervisor.image.pullPolicy }}
     supervisor_image_pull_policy = {{ .Values.supervisor.image.pullPolicy | quote }}
+    {{- end }}
+
+    {{- if not $credentialDrivers }}
+
+    [openshell.gateway.credential_storage]
+    key_encryption_key_env = {{ include "openshell.credentialStorageKeyEncryptionKeyEnvName" . | quote }}
+    {{- end }}
+
+    {{- if .Values.server.credentialDrivers.kubernetesSecrets.enabled }}
+
+    [openshell.credential_drivers.kubernetes-secrets]
+    namespace = {{ include "openshell.credentialKubernetesSecretsNamespace" . | quote }}
+    allow_reference_namespace = {{ .Values.server.credentialDrivers.kubernetesSecrets.allowReferenceNamespace }}
+    {{- end }}
+
+    {{- if .Values.server.credentialDrivers.openbao.enabled }}
+
+    [openshell.credential_drivers.openbao]
+    address = {{ .Values.server.credentialDrivers.openbao.address | quote }}
+    mount = {{ .Values.server.credentialDrivers.openbao.mount | quote }}
+    kv_version = {{ .Values.server.credentialDrivers.openbao.kvVersion | quote }}
+    auth_method = {{ .Values.server.credentialDrivers.openbao.authMethod | quote }}
+    {{- if .Values.server.credentialDrivers.openbao.role }}
+    role = {{ .Values.server.credentialDrivers.openbao.role | quote }}
+    {{- end }}
+    {{- if .Values.server.credentialDrivers.openbao.kubernetesAuthMount }}
+    kubernetes_auth_mount = {{ .Values.server.credentialDrivers.openbao.kubernetesAuthMount | quote }}
+    {{- end }}
+    {{- if .Values.server.credentialDrivers.openbao.serviceAccountTokenPath }}
+    service_account_token_path = {{ .Values.server.credentialDrivers.openbao.serviceAccountTokenPath | quote }}
+    {{- end }}
+    {{- if .Values.server.credentialDrivers.openbao.tokenPath }}
+    token_path = {{ .Values.server.credentialDrivers.openbao.tokenPath | quote }}
+    {{- end }}
+    {{- if .Values.server.credentialDrivers.openbao.timeoutSecs }}
+    timeout_secs = {{ .Values.server.credentialDrivers.openbao.timeoutSecs }}
+    {{- end }}
     {{- end }}

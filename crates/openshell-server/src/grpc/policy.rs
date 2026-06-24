@@ -1410,9 +1410,12 @@ pub(super) async fn handle_get_sandbox_provider_environment(
     let provider_names = spec.providers;
     let provider_env_revision =
         compute_provider_env_revision(state.store.as_ref(), &provider_names).await?;
-    let provider_environment =
-        super::provider::resolve_provider_environment(state.store.as_ref(), &provider_names)
-            .await?;
+    let provider_environment = super::provider::resolve_provider_environment_with_credentials(
+        state.store.as_ref(),
+        &provider_names,
+        &state.credentials,
+    )
+    .await?;
 
     info!(
         sandbox_id = %sandbox_id,
@@ -4334,6 +4337,7 @@ mod tests {
                 .collect(),
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
+            credential_handles: HashMap::new(),
         }
     }
 

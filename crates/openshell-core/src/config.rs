@@ -360,6 +360,13 @@ pub struct Config {
     /// configured driver.
     pub compute_drivers: Vec<ComputeDriverKind>,
 
+    /// Credential drivers enabled for provider credential storage.
+    pub credential_drivers: Vec<String>,
+
+    /// Optional credential-driver default retained for compatibility. When
+    /// set, it must match the single enabled credential driver.
+    pub default_credential_driver: Option<String>,
+
     /// TTL for SSH session tokens, in seconds. 0 disables expiry.
     pub ssh_session_ttl_secs: u64,
 
@@ -559,6 +566,8 @@ impl Config {
             gateway_jwt: None,
             database_url: String::new(),
             compute_drivers: vec![],
+            credential_drivers: Vec::new(),
+            default_credential_driver: None,
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
             grpc_rate_limit_requests: None,
             grpc_rate_limit_window_secs: None,
@@ -619,6 +628,24 @@ impl Config {
         I: IntoIterator<Item = ComputeDriverKind>,
     {
         self.compute_drivers = drivers.into_iter().collect();
+        self
+    }
+
+    /// Create a new configuration with the configured credential drivers.
+    #[must_use]
+    pub fn with_credential_drivers<I, S>(mut self, drivers: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.credential_drivers = drivers.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Create a new configuration with the default credential driver.
+    #[must_use]
+    pub fn with_default_credential_driver(mut self, driver: Option<impl Into<String>>) -> Self {
+        self.default_credential_driver = driver.map(Into::into);
         self
     }
 
@@ -819,6 +846,29 @@ mod tests {
     fn config_disables_unauthenticated_users_by_default() {
         let cfg = Config::new(None);
         assert!(!cfg.auth.allow_unauthenticated_users);
+    }
+
+    #[test]
+    fn config_defaults_to_internal_credential_storage() {
+        let cfg = Config::new(None);
+        assert!(cfg.credential_drivers.is_empty());
+        assert!(cfg.default_credential_driver.is_none());
+    }
+
+    #[test]
+    fn config_accepts_credential_driver_settings() {
+        let cfg = Config::new(None)
+            .with_credential_drivers(["kubernetes-secrets", "openbao"])
+            .with_default_credential_driver(Some("kubernetes-secrets"));
+
+        assert_eq!(
+            cfg.credential_drivers,
+            vec!["kubernetes-secrets".to_string(), "openbao".to_string()]
+        );
+        assert_eq!(
+            cfg.default_credential_driver.as_deref(),
+            Some("kubernetes-secrets")
+        );
     }
 
     #[test]
