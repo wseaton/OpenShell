@@ -33,6 +33,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tower::ServiceExt;
 use tower_http::request_id::{MakeRequestId, RequestId};
 use tracing::{Span, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::{
     OpenShellService, ServerState,
@@ -46,6 +47,21 @@ use crate::{
     service_http_router,
 };
 
+/// Adapter that exposes HTTP headers to OpenTelemetry's `Extractor` trait
+/// for W3C trace context propagation. gRPC metadata maps directly to HTTP/2
+/// headers, so `traceparent` arrives as a regular header.
+struct HeaderExtractor<'a>(&'a http::HeaderMap);
+
+impl opentelemetry::propagation::Extractor for HeaderExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|v| v.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(http::HeaderName::as_str).collect()
+    }
+}
+
 /// Request-ID generator that produces a UUID v4 for each inbound request.
 #[derive(Clone)]
 struct UuidRequestId;
@@ -57,8 +73,45 @@ impl MakeRequestId for UuidRequestId {
     }
 }
 
+/// gRPC methods that never get a span.
+///
+/// `Health` is a liveness poll: every client and every kubelet probe calls it
+/// on a timer, so tracing it turns the backend into a wall of empty 0ms root
+/// traces that bury real work. Add other high-frequency pollers here as they
+/// appear.
+const UNTRACED_GRPC_METHODS: &[&str] = &["Health"];
+
+/// Whether the request is gRPC, by content-type. The multiplexer routes on the
+/// same header, so this agrees with the branch the request actually takes.
+fn is_grpc_request<B>(req: &Request<B>) -> bool {
+    req.headers()
+        .get(http::header::CONTENT_TYPE)
+        .is_some_and(|v| v.as_bytes().starts_with(b"application/grpc"))
+}
+
+/// Split a gRPC path (`/openshell.v1.OpenShell/GetSandbox`) into its fully
+/// qualified service and its method. `None` when the path has no such shape.
+fn grpc_service_and_method(path: &str) -> Option<(&str, &str)> {
+    let (service, method) = path.trim_start_matches('/').rsplit_once('/')?;
+    (!service.is_empty() && !method.is_empty()).then_some((service, method))
+}
+
 /// Build a tracing span for an inbound request, recording the `request_id`
 /// header (set by [`UuidRequestId`] or supplied by the client).
+///
+/// gRPC requests are named per the `OTel` RPC semantic conventions:
+/// `{rpc.service}/{rpc.method}` (`openshell.v1.OpenShell/GetSandbox`), carried
+/// on the `otel.name` field because a tracing span name must be `'static`.
+/// Methods in [`UNTRACED_GRPC_METHODS`] get no span at all.
+///
+/// When the request carries a W3C `traceparent` header, the span is parented
+/// to the upstream trace context so distributed traces connect across the
+/// client-gateway boundary. Invalid or missing `traceparent` values are
+/// silently ignored (the span starts a new trace root).
+///
+/// Long-lived streaming RPCs (`ConnectSupervisor`, `RelayStream`) produce spans
+/// that live for the duration of the connection, so those spans are not
+/// exported until the stream closes.
 fn make_request_span<B>(req: &Request<B>) -> Span {
     let path = req.uri().path();
     let request_id = req
@@ -67,21 +120,51 @@ fn make_request_span<B>(req: &Request<B>) -> Span {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("-");
 
-    if matches!(path, "/health" | "/healthz" | "/readyz") {
-        tracing::debug_span!(
+    let rpc = is_grpc_request(req)
+        .then(|| grpc_service_and_method(path))
+        .flatten();
+
+    let span = match rpc {
+        Some((_, method)) if UNTRACED_GRPC_METHODS.contains(&method) => return Span::none(),
+        Some((service, method)) => {
+            let otel_name = format!("{service}/{method}");
+            tracing::info_span!(
+                "request",
+                method = %req.method(),
+                path,
+                request_id,
+                otel.name = otel_name.as_str(),
+                otel.kind = "server",
+                rpc.system = "grpc",
+                rpc.service = service,
+                rpc.method = method,
+            )
+        }
+        None if matches!(path, "/health" | "/healthz" | "/readyz") => tracing::debug_span!(
             "request",
             method = %req.method(),
             path,
             request_id,
-        )
-    } else {
-        tracing::info_span!(
+            otel.kind = "server",
+        ),
+        None => tracing::info_span!(
             "request",
             method = %req.method(),
             path,
             request_id,
-        )
-    }
+            otel.kind = "server",
+        ),
+    };
+
+    // Parent the span to any inbound W3C trace context. No-op when the header
+    // is absent or malformed (the span starts a new trace root).
+    let parent_cx = opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.extract(&HeaderExtractor(req.headers()))
+    });
+    // Returns Err when no OTel layer is installed; harmless.
+    let _ = span.set_parent(parent_cx);
+
+    span
 }
 
 /// Log response status and latency within the request span.
@@ -1093,6 +1176,7 @@ mod tests {
         ProviderProfileSnapshotRequest,
         gateway_interceptor_server::{GatewayInterceptor, GatewayInterceptorServer},
     };
+    use opentelemetry::trace::TraceContextExt;
     use prost::Message as _;
     use std::convert::Infallible;
     use std::sync::Mutex;
@@ -2212,5 +2296,235 @@ mod tests {
             assert_eq!(res.status(), 200);
             assert_eq!(mock.call_count(), 0, "health must not consult the chain");
         }
+    }
+
+    // ── W3C trace context extraction ────────────────────────────────────
+
+    #[test]
+    fn header_extractor_returns_known_header() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "traceparent",
+            HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        );
+        let extractor = HeaderExtractor(&headers);
+        assert_eq!(
+            opentelemetry::propagation::Extractor::get(&extractor, "traceparent"),
+            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        );
+    }
+
+    #[test]
+    fn header_extractor_returns_none_for_absent_header() {
+        let headers = http::HeaderMap::new();
+        let extractor = HeaderExtractor(&headers);
+        assert_eq!(
+            opentelemetry::propagation::Extractor::get(&extractor, "traceparent"),
+            None,
+        );
+    }
+
+    #[test]
+    fn header_extractor_returns_none_for_non_utf8_value() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "traceparent",
+            HeaderValue::from_bytes(b"\xff\xfe").expect("raw bytes are valid HeaderValue"),
+        );
+        let extractor = HeaderExtractor(&headers);
+        assert_eq!(
+            opentelemetry::propagation::Extractor::get(&extractor, "traceparent"),
+            None,
+            "non-UTF-8 header values should be silently ignored"
+        );
+    }
+
+    #[test]
+    fn header_extractor_keys_lists_all_header_names() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("traceparent", HeaderValue::from_static("value1"));
+        headers.insert("tracestate", HeaderValue::from_static("value2"));
+        let extractor = HeaderExtractor(&headers);
+        let keys = opentelemetry::propagation::Extractor::keys(&extractor);
+        assert!(keys.contains(&"traceparent"));
+        assert!(keys.contains(&"tracestate"));
+    }
+
+    #[test]
+    fn traceparent_extraction_with_valid_header_produces_remote_context() {
+        // Register the W3C propagator for this test.
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "traceparent",
+            HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        );
+        let parent_cx = opentelemetry::global::get_text_map_propagator(|p| {
+            p.extract(&HeaderExtractor(&headers))
+        });
+
+        let span_ctx = parent_cx.span().span_context().clone();
+        assert!(span_ctx.is_remote(), "extracted context should be remote");
+        assert!(span_ctx.is_valid(), "extracted context should be valid");
+        assert_eq!(
+            format!("{:032x}", span_ctx.trace_id()),
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
+    }
+
+    #[test]
+    fn traceparent_extraction_with_garbage_produces_empty_context() {
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "traceparent",
+            HeaderValue::from_static("not-a-valid-traceparent"),
+        );
+        let parent_cx = opentelemetry::global::get_text_map_propagator(|p| {
+            p.extract(&HeaderExtractor(&headers))
+        });
+
+        let span_ctx = parent_cx.span().span_context().clone();
+        assert!(
+            !span_ctx.is_valid(),
+            "garbage traceparent should produce invalid context"
+        );
+    }
+
+    #[test]
+    fn traceparent_extraction_without_header_produces_empty_context() {
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
+
+        let headers = http::HeaderMap::new();
+        let parent_cx = opentelemetry::global::get_text_map_propagator(|p| {
+            p.extract(&HeaderExtractor(&headers))
+        });
+
+        let span_ctx = parent_cx.span().span_context().clone();
+        assert!(
+            !span_ctx.is_valid(),
+            "absent traceparent should produce invalid context"
+        );
+    }
+
+    // ── gRPC span naming and the untraced skip-list ──────────────────────
+
+    fn grpc_request(path: &str) -> Request<Empty<Bytes>> {
+        Request::builder()
+            .uri(path)
+            .header("content-type", "application/grpc")
+            .body(Empty::<Bytes>::new())
+            .expect("valid request")
+    }
+
+    /// Capture span close events from `make_request_span` into a string.
+    fn span_trace_output(req: &Request<Empty<Bytes>>) -> (String, bool) {
+        use tracing_subscriber::fmt::format::FmtSpan;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let log_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let writer = TraceBuf(log_buf.clone());
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_span_events(FmtSpan::CLOSE);
+        let subscriber = tracing_subscriber::registry().with(fmt_layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let span = make_request_span(req);
+        let is_none = span.is_none();
+        drop(span.enter());
+        drop(span);
+
+        let output = String::from_utf8(log_buf.lock().expect("lock").clone()).expect("utf8");
+        (output, is_none)
+    }
+
+    #[test]
+    fn grpc_service_and_method_splits_qualified_path() {
+        assert_eq!(
+            grpc_service_and_method("/openshell.v1.OpenShell/GetSandbox"),
+            Some(("openshell.v1.OpenShell", "GetSandbox"))
+        );
+        assert_eq!(
+            grpc_service_and_method("/openshell.inference.v1.Inference/GetInferenceBundle"),
+            Some(("openshell.inference.v1.Inference", "GetInferenceBundle"))
+        );
+    }
+
+    #[test]
+    fn grpc_service_and_method_rejects_malformed_paths() {
+        assert_eq!(grpc_service_and_method("Health"), None);
+        assert_eq!(grpc_service_and_method("/Health"), None);
+        assert_eq!(grpc_service_and_method("/"), None);
+        assert_eq!(grpc_service_and_method(""), None);
+        assert_eq!(grpc_service_and_method("/openshell.v1.OpenShell/"), None);
+    }
+
+    #[test]
+    fn is_grpc_request_keys_off_content_type() {
+        assert!(is_grpc_request(&grpc_request(
+            "/openshell.v1.OpenShell/GetSandbox"
+        )));
+
+        let plain = Request::builder()
+            .uri("/healthz")
+            .body(Empty::<Bytes>::new())
+            .expect("valid request");
+        assert!(!is_grpc_request(&plain));
+    }
+
+    #[test]
+    fn grpc_span_is_named_by_rpc_method() {
+        let (output, is_none) =
+            span_trace_output(&grpc_request("/openshell.v1.OpenShell/GetSandbox"));
+
+        assert!(!is_none, "non-health gRPC calls must be traced");
+        assert!(
+            output.contains("otel.name=\"openshell.v1.OpenShell/GetSandbox\""),
+            "exported span name should follow the OTel RPC semconv, got: {output}"
+        );
+        assert!(
+            output.contains("rpc.service=\"openshell.v1.OpenShell\""),
+            "span should carry rpc.service, got: {output}"
+        );
+        assert!(
+            output.contains("rpc.method=\"GetSandbox\""),
+            "span should carry rpc.method, got: {output}"
+        );
+    }
+
+    #[test]
+    fn health_rpc_produces_no_span() {
+        let (output, is_none) = span_trace_output(&grpc_request("/openshell.v1.OpenShell/Health"));
+
+        assert!(is_none, "Health is on the untraced skip-list");
+        assert!(
+            output.is_empty(),
+            "Health must not emit a span at all, got: {output}"
+        );
+    }
+
+    #[test]
+    fn http_requests_keep_the_generic_request_span() {
+        let req = Request::builder()
+            .uri("/auth/connect")
+            .body(Empty::<Bytes>::new())
+            .expect("valid request");
+        let (output, is_none) = span_trace_output(&req);
+
+        assert!(!is_none, "HTTP requests are still traced");
+        assert!(
+            !output.contains("otel.name"),
+            "HTTP spans keep their static name, got: {output}"
+        );
     }
 }
