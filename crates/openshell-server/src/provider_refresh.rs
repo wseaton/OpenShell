@@ -659,9 +659,7 @@ async fn mint_aws_assume_role_with_web_identity(
 /// ISO timestamps, none of which contain `<` or `>`), so a targeted tag
 /// extractor is sufficient and avoids a full XML dependency. Note STS names the
 /// token `<SessionToken>` while the container endpoint calls it `Token`.
-fn parse_sts_credentials(
-    xml: &str,
-) -> Result<openshell_core::aws::ContainerCredentials, Status> {
+fn parse_sts_credentials(xml: &str) -> Result<openshell_core::aws::ContainerCredentials, Status> {
     let field = |tag: &str| -> Result<String, Status> {
         xml_tag_text(xml, tag)
             .ok_or_else(|| Status::failed_precondition(format!("STS response missing <{tag}>")))

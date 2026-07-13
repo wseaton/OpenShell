@@ -65,6 +65,12 @@ anyhow = { workspace = true }
 # Logging
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+
+# OpenTelemetry (optional OTLP span export, env-gated at runtime)
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
 
 # Metrics
 metrics = { workspace = true }

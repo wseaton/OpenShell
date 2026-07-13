@@ -14,6 +14,87 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, Layer};
 
+// ---------------------------------------------------------------------------
+// OTLP span export (env-gated)
+// ---------------------------------------------------------------------------
+
+/// Build an optional OpenTelemetry layer for OTLP span export.
+///
+/// Returns `Some` only when `OTEL_EXPORTER_OTLP_ENDPOINT` or
+/// `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is set in the environment. When
+/// neither is present, this returns `None` and the subscriber operates
+/// exactly as before (zero overhead, no `OTel` runtime).
+///
+/// The layer is filtered to exclude tracing events emitted under
+/// `target = "ocsf"`. Those events feed the OCSF audit pipeline via
+/// `event_bridge` and must flow to log output, but exporting every
+/// OCSF event as an `OTel` span event would explode cardinality on the
+/// trace backend for no diagnostic value.
+fn init_otel_layer<S>() -> Option<impl Layer<S>>
+where
+    S: Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+{
+    use opentelemetry::trace::TracerProvider as _;
+
+    let has_endpoint = std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_some()
+        || std::env::var_os("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT").is_some();
+    if !has_endpoint {
+        return None;
+    }
+
+    // The OTLP exporter reads its own env vars (endpoint, headers, protocol)
+    // so we don't duplicate that configuration here.
+    let exporter = match opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .build()
+    {
+        Ok(e) => e,
+        Err(err) => {
+            eprintln!(
+                "openshell-gateway: failed to build OTLP exporter, spans will not be exported: {err}"
+            );
+            return None;
+        }
+    };
+
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(
+            opentelemetry_sdk::Resource::builder()
+                .with_service_name("openshell-gateway")
+                .build(),
+        )
+        .build();
+
+    // Register the W3C TraceContext propagator so `make_request_span` can
+    // extract `traceparent` headers from inbound requests.
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
+
+    // Register as the global provider so `set_parent` context propagation works.
+    opentelemetry::global::set_tracer_provider(provider.clone());
+
+    let otel_layer =
+        tracing_opentelemetry::OpenTelemetryLayer::new(provider.tracer("openshell-gateway"));
+
+    // Filter out OCSF events from the `OTel` layer.
+    let filtered = otel_layer.with_filter(OcsfFilter);
+    Some(filtered)
+}
+
+/// Filter that excludes tracing events and spans with `target = "ocsf"` from
+/// the OpenTelemetry layer. OCSF events are high-cardinality audit records
+/// that belong in structured logs, not distributed traces.
+#[derive(Clone)]
+struct OcsfFilter;
+
+impl<S> tracing_subscriber::layer::Filter<S> for OcsfFilter {
+    fn enabled(&self, meta: &tracing::Metadata<'_>, _cx: &Context<'_, S>) -> bool {
+        meta.target() != OCSF_TARGET
+    }
+}
+
 /// Bus that publishes server log lines keyed by sandbox id.
 #[derive(Debug, Clone)]
 pub struct TracingLogBus {
@@ -46,16 +127,27 @@ impl TracingLogBus {
     }
 
     /// Install a tracing subscriber that logs to stdout and publishes events into this bus.
+    ///
+    /// When `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is set,
+    /// an OpenTelemetry layer is added that exports spans over OTLP (service.name =
+    /// `openshell-gateway`). When neither env var is set, no `OTel` layer is installed and
+    /// existing logging behavior is unchanged.
+    ///
+    /// The `OTel` layer excludes events with `target = "ocsf"` to keep the OCSF event
+    /// pipeline (used by `event_bridge`) flowing to logs without polluting span export.
     pub fn install_subscriber(&self, env_filter: EnvFilter) {
         let layer = SandboxLogLayer {
             bus: self.clone(),
             default_tail: Self::DEFAULT_TAIL,
         };
 
+        let otel_layer = init_otel_layer();
+
         tracing_subscriber::registry()
             .with(env_filter)
             .with(tracing_subscriber::fmt::layer())
             .with(layer)
+            .with(otel_layer)
             .init();
     }
 
