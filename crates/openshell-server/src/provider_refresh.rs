@@ -859,11 +859,102 @@ async fn mint_aws_sts_assume_role(
     let role_arn = required_material(&state.material, "role_arn")?;
     let session_name = material_value(&state.material, &["session_name"])
         .unwrap_or_else(|| "openshell-sandbox".to_string());
-    let external_id = material_value(&state.material, &["external_id"]);
     let region =
         material_value(&state.material, &["aws_region"]).unwrap_or_else(|| "us-east-1".to_string());
 
-    let region_provider = aws_sdk_sts::config::Region::new(region);
+    let max_lifetime_i64 = if state.max_lifetime_seconds > 0 {
+        state.max_lifetime_seconds
+    } else {
+        DEFAULT_MAX_LIFETIME_SECONDS
+    };
+    let max_lifetime = i32::try_from(max_lifetime_i64.min(i64::from(i32::MAX))).unwrap_or(i32::MAX);
+
+    // AssumeRole and AssumeRoleWithWebIdentity mint the same shape of STS
+    // temporary credentials; they differ only in how the caller proves identity
+    // to STS. A `web_identity_token_file` (a k8s-projected service-account token)
+    // selects the web-identity path, which exchanges that JWT for role
+    // credentials with no static keys on the gateway. Otherwise we assume the
+    // role with explicit or ambient source credentials. The two are mutually
+    // exclusive (enforced at the configure boundary).
+    let creds = if let Some(token_file) =
+        material_value(&state.material, &["web_identity_token_file"])
+    {
+        assume_role_with_web_identity(
+            state,
+            &role_arn,
+            &session_name,
+            &region,
+            &token_file,
+            max_lifetime,
+        )
+        .await?
+    } else {
+        assume_role_with_source_credentials(state, &role_arn, &session_name, &region, max_lifetime)
+            .await?
+    };
+
+    let access_key_id = creds.access_key_id().to_string();
+    let secret_access_key = creds.secret_access_key().to_string();
+    let session_token = creds.session_token().to_string();
+
+    let now_ms = current_time_ms();
+    let max_lifetime_ms = i64::from(max_lifetime).saturating_mul(1000);
+    let max_expires = now_ms.saturating_add(max_lifetime_ms);
+    let expires_at_ms = creds.expiration().to_millis().unwrap_or(max_expires);
+    let expires_at_ms = expires_at_ms.min(max_expires);
+
+    // Map STS response fields to the env keys the profile bound to each semantic
+    // output. Configure pins these from the profile's additional_outputs, so a
+    // missing mapping means the state was not configured against a valid AWS STS
+    // profile binding; refuse rather than guessing standard AWS names.
+    let output_values = [
+        ("secret_access_key", secret_access_key),
+        ("session_token", session_token),
+    ];
+    let mut additional = HashMap::new();
+    for (output_id, value) in output_values {
+        let env_key = state.additional_output_keys.get(output_id).ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "refresh state missing resolved output key for '{output_id}'; reconfigure the AWS STS refresh"
+            ))
+        })?;
+        additional.insert(env_key.clone(), value);
+    }
+
+    Ok(MintedCredential {
+        access_token: access_key_id,
+        expires_at_ms,
+        refresh_token: None,
+        additional_credentials: additional,
+    })
+}
+
+/// Build an STS client from a resolved SDK config, honouring the test-only
+/// endpoint override. The override is loopback-gated and rejected at the
+/// configure boundary, so in production the endpoint always resolves from the
+/// region and an AWS-signed request cannot be redirected at an arbitrary service
+/// (CWE-918). See [`test_sts_endpoint_override`].
+fn build_sts_client(
+    sdk_config: &aws_config::SdkConfig,
+    state: &StoredProviderCredentialRefreshState,
+) -> aws_sdk_sts::Client {
+    let mut builder = aws_sdk_sts::config::Builder::from(sdk_config);
+    if let Some(endpoint) = test_sts_endpoint_override(state) {
+        builder = builder.endpoint_url(endpoint);
+    }
+    aws_sdk_sts::Client::from_conf(builder.build())
+}
+
+/// Assume the role with static or ambient source credentials (`AssumeRole`).
+async fn assume_role_with_source_credentials(
+    state: &StoredProviderCredentialRefreshState,
+    role_arn: &str,
+    session_name: &str,
+    region: &str,
+    max_lifetime: i32,
+) -> Result<aws_sdk_sts::types::Credentials, Status> {
+    let external_id = material_value(&state.material, &["external_id"]);
+    let region_provider = aws_sdk_sts::config::Region::new(region.to_string());
     let mut config_loader =
         aws_config::defaults(aws_config::BehaviorVersion::latest()).region(region_provider);
 
@@ -901,31 +992,12 @@ async fn mint_aws_sts_assume_role(
     }
 
     let sdk_config = config_loader.load().await;
-    let sts_config = {
-        let mut builder = aws_sdk_sts::config::Builder::from(&sdk_config);
-        // Endpoint overrides exist only to point tests at a local mock STS. In
-        // production the endpoint is always resolved from the region so a caller
-        // cannot redirect an AWS-signed AssumeRole request at an arbitrary
-        // service (CWE-918). See `test_sts_endpoint_override`.
-        if let Some(endpoint) = test_sts_endpoint_override(state) {
-            builder = builder.endpoint_url(endpoint);
-        }
-        builder.build()
-    };
-    let client = aws_sdk_sts::Client::from_conf(sts_config);
-
-    let max_lifetime_i64 = if state.max_lifetime_seconds > 0 {
-        state.max_lifetime_seconds
-    } else {
-        DEFAULT_MAX_LIFETIME_SECONDS
-    };
-    let max_lifetime = i32::try_from(max_lifetime_i64.min(i64::from(i32::MAX))).unwrap_or(i32::MAX);
-    let max_lifetime_ms = i64::from(max_lifetime).saturating_mul(1000);
+    let client = build_sts_client(&sdk_config, state);
 
     let mut req = client
         .assume_role()
-        .role_arn(&role_arn)
-        .role_session_name(&session_name)
+        .role_arn(role_arn)
+        .role_session_name(session_name)
         .duration_seconds(max_lifetime);
 
     if let Some(eid) = external_id {
@@ -937,42 +1009,60 @@ async fn mint_aws_sts_assume_role(
         .await
         .map_err(|e| Status::internal(format!("STS AssumeRole failed: {e}")))?;
 
-    let creds = resp
-        .credentials()
-        .ok_or_else(|| Status::internal("STS AssumeRole response missing credentials"))?;
+    resp.credentials()
+        .cloned()
+        .ok_or_else(|| Status::internal("STS AssumeRole response missing credentials"))
+}
 
-    let access_key_id = creds.access_key_id().to_string();
-    let secret_access_key = creds.secret_access_key().to_string();
-    let session_token = creds.session_token().to_string();
-
-    let now_ms = current_time_ms();
-    let max_expires = now_ms.saturating_add(max_lifetime_ms);
-    let expires_at_ms = creds.expiration().to_millis().unwrap_or(max_expires);
-    let expires_at_ms = expires_at_ms.min(max_expires);
-
-    // Map STS response fields to the env keys the profile bound to each semantic
-    // output. Configure pins these from the profile's additional_outputs, so a
-    // missing mapping means the state was not configured against a valid AWS STS
-    // profile binding; refuse rather than guessing standard AWS names.
-    let output_values = [
-        ("secret_access_key", secret_access_key),
-        ("session_token", session_token),
-    ];
-    let mut additional = HashMap::new();
-    for (output_id, value) in output_values {
-        let env_key = state.additional_output_keys.get(output_id).ok_or_else(|| {
-            Status::failed_precondition(format!(
-                "refresh state missing resolved output key for '{output_id}'; reconfigure the AWS STS refresh"
-            ))
-        })?;
-        additional.insert(env_key.clone(), value);
+/// Exchange a projected web-identity token for role credentials
+/// (`AssumeRoleWithWebIdentity`). The token is a k8s-projected service-account
+/// JWT; STS trusts it via the role's OIDC trust policy, so no static AWS keys
+/// ever touch the gateway.
+async fn assume_role_with_web_identity(
+    state: &StoredProviderCredentialRefreshState,
+    role_arn: &str,
+    session_name: &str,
+    region: &str,
+    token_file: &str,
+    max_lifetime: i32,
+) -> Result<aws_sdk_sts::types::Credentials, Status> {
+    // Read the token fresh on every mint: the projected-SA-token volume rotates
+    // the file in place, so a cached value would eventually present an expired
+    // assertion to STS.
+    let token = tokio::fs::read_to_string(token_file).await.map_err(|e| {
+        Status::failed_precondition(format!("read web_identity_token_file failed: {e}"))
+    })?;
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(Status::failed_precondition(
+            "web_identity_token_file is empty",
+        ));
     }
 
-    Ok(MintedCredential {
-        access_token: access_key_id,
-        expires_at_ms,
-        refresh_token: None,
-        additional_credentials: additional,
+    let region_provider = aws_sdk_sts::config::Region::new(region.to_string());
+    // AssumeRoleWithWebIdentity is an unsigned STS call: the web-identity JWT is
+    // the proof of identity, not a SigV4 signature. `no_credentials()` stops the
+    // SDK from probing the gateway's ambient credential chain for a request that
+    // never needs it.
+    let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(region_provider)
+        .no_credentials()
+        .load()
+        .await;
+    let client = build_sts_client(&sdk_config, state);
+
+    let resp = client
+        .assume_role_with_web_identity()
+        .role_arn(role_arn)
+        .role_session_name(session_name)
+        .web_identity_token(token)
+        .duration_seconds(max_lifetime)
+        .send()
+        .await
+        .map_err(|e| Status::internal(format!("STS AssumeRoleWithWebIdentity failed: {e}")))?;
+
+    resp.credentials().cloned().ok_or_else(|| {
+        Status::internal("STS AssumeRoleWithWebIdentity response missing credentials")
     })
 }
 
@@ -1980,6 +2070,125 @@ mod tests {
             stored.credentials.get("AWS_SESSION_TOKEN"),
             Some(&"MockSessionTokenXYZ".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn aws_sts_web_identity_mints_credentials_from_mock_endpoint() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("Action=AssumeRoleWithWebIdentity"))
+            .and(body_string_contains("WebIdentityToken=projected-sa-jwt"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<AssumeRoleWithWebIdentityResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
+  <AssumeRoleWithWebIdentityResult>
+    <SubjectFromWebIdentityToken>system:serviceaccount:ns:sa</SubjectFromWebIdentityToken>
+    <AssumedRoleUser>
+      <AssumedRoleId>AROA3XFRBF23:web-identity-session</AssumedRoleId>
+      <Arn>arn:aws:sts::123456789012:assumed-role/TestRole/web-identity-session</Arn>
+    </AssumedRoleUser>
+    <Credentials>
+      <AccessKeyId>ASIAWEBIDKEY</AccessKeyId>
+      <SecretAccessKey>WebIdentitySecret123</SecretAccessKey>
+      <SessionToken>WebIdentitySessionTokenXYZ</SessionToken>
+      <Expiration>2099-01-01T00:00:00Z</Expiration>
+    </Credentials>
+  </AssumeRoleWithWebIdentityResult>
+  <ResponseMetadata>
+    <RequestId>01234567-89ab-cdef-0123-456789abcdef</RequestId>
+  </ResponseMetadata>
+</AssumeRoleWithWebIdentityResponse>"#,
+            ))
+            .mount(&mock_server)
+            .await;
+
+        // Write the projected web-identity token to a file the mint reads at
+        // rotation time, mirroring the k8s projected-SA-token volume.
+        let token_path =
+            std::env::temp_dir().join(format!("openshell-web-identity-{}.jwt", std::process::id()));
+        std::fs::write(&token_path, "projected-sa-jwt").unwrap();
+
+        let store = test_store().await;
+        crate::grpc::policy::set_global_bool_setting_for_test(
+            &store,
+            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
+            true,
+        )
+        .await
+        .unwrap();
+        let prov = provider("aws-web-identity-test", "aws");
+        store.put_message(&prov).await.unwrap();
+
+        let state = new_refresh_state(
+            &prov,
+            "default",
+            "AWS_ACCESS_KEY_ID",
+            NewRefreshStateConfig {
+                additional_output_keys: HashMap::from([
+                    (
+                        "secret_access_key".to_string(),
+                        "AWS_SECRET_ACCESS_KEY".to_string(),
+                    ),
+                    ("session_token".to_string(), "AWS_SESSION_TOKEN".to_string()),
+                ]),
+                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole,
+                material: HashMap::from([
+                    (
+                        "role_arn".to_string(),
+                        "arn:aws:iam::123456789012:role/TestRole".to_string(),
+                    ),
+                    (
+                        "session_name".to_string(),
+                        "web-identity-session".to_string(),
+                    ),
+                    (
+                        "web_identity_token_file".to_string(),
+                        token_path.to_string_lossy().to_string(),
+                    ),
+                    ("sts_endpoint_url".to_string(), mock_server.uri()),
+                ]),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: 0,
+                token_url: String::new(),
+                scopes: Vec::new(),
+                refresh_before_seconds: 300,
+                max_lifetime_seconds: 3600,
+            },
+        )
+        .unwrap();
+        put_refresh_state(&store, &state).await.unwrap();
+
+        let refreshed = refresh_provider_credential(
+            &store,
+            "default",
+            None,
+            None,
+            "aws-web-identity-test",
+            "AWS_ACCESS_KEY_ID",
+        )
+        .await
+        .unwrap();
+        assert_eq!(refreshed.status, "refreshed");
+        assert!(refreshed.expires_at_ms > 0);
+
+        let stored = store
+            .get_message_by_name::<Provider>("default", "aws-web-identity-test")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.credentials.get("AWS_ACCESS_KEY_ID"),
+            Some(&"ASIAWEBIDKEY".to_string())
+        );
+        assert_eq!(
+            stored.credentials.get("AWS_SECRET_ACCESS_KEY"),
+            Some(&"WebIdentitySecret123".to_string())
+        );
+        assert_eq!(
+            stored.credentials.get("AWS_SESSION_TOKEN"),
+            Some(&"WebIdentitySessionTokenXYZ".to_string())
+        );
+
+        let _ = std::fs::remove_file(&token_path);
     }
 
     #[tokio::test]
