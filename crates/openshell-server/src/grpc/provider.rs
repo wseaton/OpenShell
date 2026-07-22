@@ -2538,6 +2538,20 @@ pub(super) async fn handle_configure_provider_refresh(
             "aws_session_token requires aws_access_key_id and aws_secret_access_key",
         ));
     }
+    // Web identity (AssumeRoleWithWebIdentity) and static source credentials
+    // (AssumeRole) are two distinct ways to prove identity to STS for the same
+    // role. Supplying both is a configuration error: the web-identity path never
+    // uses source keys, so accepting them would silently ignore the caller's
+    // stated intent (CWE-20).
+    let has_web_identity = request
+        .material
+        .get("web_identity_token_file")
+        .is_some_and(|value| !value.trim().is_empty());
+    if has_web_identity && (has_source_access_key || has_source_session_token) {
+        return Err(Status::invalid_argument(
+            "web_identity_token_file cannot be combined with aws_access_key_id/aws_secret_access_key/aws_session_token",
+        ));
+    }
     if request
         .expires_at_ms
         .is_some_and(|expires_at_ms| expires_at_ms < 0)
@@ -7667,6 +7681,89 @@ mod tests {
 
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("both be set or both omitted"));
+    }
+
+    #[tokio::test]
+    async fn configure_aws_sts_rejects_web_identity_with_source_credentials() {
+        use crate::grpc::StoredSettingValue;
+        use crate::grpc::StoredSettings;
+        use crate::grpc::policy::save_global_settings;
+
+        let state = test_server_state().await;
+        let global_settings = StoredSettings {
+            revision: 1,
+            settings: std::iter::once((
+                openshell_core::settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                StoredSettingValue::Bool(true),
+            ))
+            .collect(),
+            ..Default::default()
+        };
+        save_global_settings(state.store.as_ref(), &global_settings)
+            .await
+            .unwrap();
+
+        create_provider_record(
+            state.store.as_ref(),
+            "default",
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "aws-web-identity-conflict".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: "default".to_string(),
+                    deletion_timestamp_ms: 0,
+                }),
+                r#type: "aws".to_string(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+                profile_workspace: "default".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Web identity and static source credentials are two distinct proofs of
+        // identity to STS; supplying both is a configuration error rather than a
+        // silent precedence choice.
+        let err = handle_configure_provider_refresh(
+            &state,
+            Request::new(ConfigureProviderRefreshRequest {
+                provider: "aws-web-identity-conflict".to_string(),
+                credential_key: "AWS_ACCESS_KEY_ID".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
+                material: HashMap::from([
+                    (
+                        "role_arn".to_string(),
+                        "arn:aws:iam::123456789012:role/Test".to_string(),
+                    ),
+                    (
+                        "web_identity_token_file".to_string(),
+                        "/var/run/secrets/aws/token".to_string(),
+                    ),
+                    ("aws_access_key_id".to_string(), "AKIATESTKEY".to_string()),
+                    (
+                        "aws_secret_access_key".to_string(),
+                        "TestSecretKey".to_string(),
+                    ),
+                ]),
+                secret_material_keys: vec!["aws_secret_access_key".to_string()],
+                expires_at_ms: None,
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(
+            err.message()
+                .contains("web_identity_token_file cannot be combined")
+        );
     }
 
     #[tokio::test]

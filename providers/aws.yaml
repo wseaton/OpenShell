@@ -51,6 +51,10 @@ credentials:
           description: Session token for temporary source credentials (SSO or a prior AssumeRole); requires the access/secret pair
           required: false
           secret: true
+        - name: web_identity_token_file
+          description: Path to a projected web-identity token (k8s service-account JWT). When set, the role is assumed via AssumeRoleWithWebIdentity and no static source credentials are used.
+          required: false
+          secret: false
   - name: secret_access_key
     description: AWS secret access key (co-managed with access_key_id)
     env_vars: [AWS_SECRET_ACCESS_KEY]
