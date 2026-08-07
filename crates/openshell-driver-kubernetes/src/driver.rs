@@ -3536,6 +3536,17 @@ fn sandbox_template_to_k8s_with_validated_config(
         serde_json::json!(false),
     );
 
+    // The supervisor is a static musl binary, and musl's getaddrinfo gives up on the whole lookup
+    // when a search-domain candidate draws anything other than NXDOMAIN. Clusters that append a
+    // corporate search domain (whose resolver answers SERVFAIL/REFUSED for made-up names) therefore
+    // break every declared-endpoint resolution the proxy does, while glibc callers in the same pod
+    // resolve fine. ndots:1 makes a dotted name try absolute FIRST, so declared endpoints never
+    // reach the poisoned suffixes.
+    spec.insert(
+        "dnsConfig".to_string(),
+        serde_json::json!({"options": [{"name": "ndots", "value": "1"}]}),
+    );
+
     let mut container = serde_json::Map::new();
     container.insert("name".to_string(), serde_json::json!("agent"));
     // Use template image if provided, otherwise fall back to default
@@ -6896,6 +6907,25 @@ mod tests {
             4,
             "extra capabilities must not be added when user namespaces are disabled"
         );
+    }
+
+    /// musl (the supervisor is static-musl) aborts a lookup when a search-domain candidate draws
+    /// SERVFAIL/REFUSED, which corporate search domains do. ndots:1 tries dotted names absolute
+    /// first, so declared-endpoint resolution never depends on the search list.
+    #[test]
+    fn sandbox_pods_get_musl_safe_ndots() {
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &SandboxPodParams::default(),
+        );
+        let options = pod_template["spec"]["dnsConfig"]["options"]
+            .as_array()
+            .expect("sandbox pods must pin a dnsConfig");
+        assert_eq!(options[0]["name"], "ndots");
+        assert_eq!(options[0]["value"], "1");
     }
 
     #[test]
