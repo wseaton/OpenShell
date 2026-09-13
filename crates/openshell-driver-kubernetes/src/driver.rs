@@ -180,6 +180,10 @@ struct KubernetesPodDriverConfig {
     runtime_class_name: String,
     tolerations: Vec<serde_json::Value>,
     priority_class_name: String,
+    /// Additional hostname -> IP mappings to place in the sandbox pod's `/etc/hosts`.
+    /// These are supplied by the caller through the selected driver's config so
+    /// DNS-dark external services keep their TLS hostname while remaining reachable.
+    host_aliases: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -3726,14 +3730,11 @@ fn sandbox_template_to_k8s_with_validated_config(
     );
     spec.insert("volumes".to_string(), serde_json::Value::Array(volumes));
 
-    // Add hostAliases so sandbox pods can reach the Docker host.
-    if !params.host_gateway_ip.is_empty() {
+    let host_aliases = host_alias_entries(params.host_gateway_ip, &driver_config.pod.host_aliases);
+    if !host_aliases.is_empty() {
         spec.insert(
             "hostAliases".to_string(),
-            serde_json::json!([{
-                "ip": params.host_gateway_ip,
-                "hostnames": ["host.docker.internal", "host.openshell.internal"]
-            }]),
+            serde_json::Value::Array(host_aliases),
         );
     }
 
@@ -3772,6 +3773,32 @@ fn sandbox_template_to_k8s_with_validated_config(
     }
 
     result
+}
+
+fn host_alias_entries(
+    gateway_ip: &str,
+    custom_aliases: &BTreeMap<String, String>,
+) -> Vec<serde_json::Value> {
+    let mut by_ip: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    if !gateway_ip.is_empty() {
+        by_ip.insert(
+            gateway_ip,
+            vec![
+                "host.docker.internal".to_string(),
+                "host.openshell.internal".to_string(),
+            ],
+        );
+    }
+    for (hostname, ip) in custom_aliases {
+        let hostnames = by_ip.entry(ip.as_str()).or_default();
+        if !hostnames.iter().any(|existing| existing == hostname) {
+            hostnames.push(hostname.clone());
+        }
+    }
+    by_ip
+        .into_iter()
+        .map(|(ip, hostnames)| serde_json::json!({"ip": ip, "hostnames": hostnames}))
+        .collect()
 }
 
 fn apply_pod_driver_config(
@@ -6521,6 +6548,42 @@ mod tests {
             pod_template["spec"]["hostAliases"].is_null(),
             "hostAliases should not be present when host_gateway_ip is empty"
         );
+    }
+
+    #[test]
+    fn custom_host_aliases_are_merged_with_gateway_aliases() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "pod": {
+                    "host_aliases": {
+                        "maas.example.com": "10.0.0.8"
+                    }
+                }
+            }))),
+            ..SandboxTemplate::default()
+        };
+        let params = SandboxPodParams {
+            host_gateway_ip: "172.17.0.1",
+            ..Default::default()
+        };
+
+        let pod_template = sandbox_template_to_k8s(
+            &template,
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+        let host_aliases = pod_template["spec"]["hostAliases"]
+            .as_array()
+            .expect("hostAliases should exist");
+        assert_eq!(host_aliases.len(), 2);
+        assert!(host_aliases.iter().any(|entry| {
+            entry["ip"] == "10.0.0.8"
+                && entry["hostnames"]
+                    .as_array()
+                    .is_some_and(|names| names.contains(&serde_json::json!("maas.example.com")))
+        }));
     }
 
     #[test]
