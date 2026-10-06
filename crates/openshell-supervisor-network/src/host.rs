@@ -220,6 +220,7 @@ pub async fn start_host_proxy(config: HostProxyConfig) -> Result<HostProxyHandle
         ready_rx,
         &upstream_proxy_args,
         None,
+        openshell_isolation_interface::static_hosts::StaticHosts::default(),
         None,
         None,
         Some(direct_listener_identity),

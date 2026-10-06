@@ -757,6 +757,7 @@ pub async fn run_network_proxy(
         &upstream_proxy_args,
         additional_ca_bundle.as_deref(),
         None,
+        openshell_isolation_interface::static_hosts::StaticHosts::default(),
         #[cfg(target_os = "linux")]
         None,
         None,
@@ -1446,6 +1447,7 @@ pub async fn run_sandbox_instance(
         .is_none()
         .then(|| remote_boundary.0.network_mediation_source());
     let remote_host_gateway_ip = remote_boundary.0.host_gateway_ip();
+    let remote_static_hosts = remote_boundary.0.static_hosts();
     let takeover_attach = remote_boundary.0.is_takeover();
     let adopts_running_agent = remote_boundary.0.adopts_running_agent();
     let (bound, backend_name, ca_file_paths) = remote_boundary;
@@ -1488,6 +1490,7 @@ pub async fn run_sandbox_instance(
             &upstream_proxy_args,
             additional_ca_bundle.as_deref(),
             remote_host_gateway_ip,
+            remote_static_hosts,
             #[cfg(target_os = "linux")]
             None,
             remote_network_source,

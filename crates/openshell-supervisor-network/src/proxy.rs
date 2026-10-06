@@ -317,6 +317,7 @@ impl ProxyHandle {
         engine_ready: tokio::sync::watch::Receiver<bool>,
         upstream_proxy_args: &upstream_proxy::UpstreamProxyArgs,
         backend_host_gateway: Option<IpAddr>,
+        static_hosts: openshell_isolation_interface::static_hosts::StaticHosts,
         network_mediation_source: Option<Arc<NetworkMediationSource>>,
         policy_dns_store: Option<Arc<ResolvedEndpointStore>>,
         direct_listener_identity: Option<ContractBinaryIdentity>,
@@ -374,6 +375,7 @@ impl ProxyHandle {
         // by sandbox workloads cannot influence the stored value.
         let trusted_host_gateway: Arc<Option<IpAddr>> = Arc::new(detect_trusted_host_gateway());
         let backend_host_gateway = Arc::new(backend_host_gateway);
+        let static_hosts = Arc::new(static_hosts);
         if let Some(ref ip) = *trusted_host_gateway {
             tracing::info!(
                 %ip,
@@ -491,6 +493,7 @@ impl ProxyHandle {
                                     let cache = identity_cache.clone();
                                     let backend_gateway = *backend_host_gateway;
                                     let trusted_gateway = *trusted_host_gateway;
+                                    let statics = static_hosts.clone();
                                     let dtx = denial_tx.clone();
                                     let has_policy_local = policy_local_ctx.is_some();
                                     let reserved = reserved_destination.clone();
@@ -502,6 +505,7 @@ impl ProxyHandle {
                                             &cache,
                                             backend_gateway,
                                             trusted_gateway,
+                                            &statics,
                                             has_policy_local,
                                             dtx.as_ref(),
                                             reserved.as_ref(),
@@ -555,6 +559,7 @@ impl ProxyHandle {
                         let proposals = agent_proposals.clone();
                         let gw = trusted_host_gateway.clone();
                         let backend_gw = backend_host_gateway.clone();
+                        let statics = static_hosts.clone();
                         let up_proxy = upstream_proxy.clone();
                         let credentials = provider_credentials.clone();
                         let dns_store = policy_dns_store.clone();
@@ -581,6 +586,7 @@ impl ProxyHandle {
                                 proposals,
                                 backend_gw,
                                 gw,
+                                statics,
                                 up_proxy,
                                 credentials,
                                 resolver,
@@ -651,6 +657,7 @@ async fn preauthorize_transparent_open(
     identity_cache: &BinaryIdentityCache,
     backend_host_gateway: Option<IpAddr>,
     trusted_host_gateway: Option<IpAddr>,
+    static_hosts: &openshell_isolation_interface::static_hosts::StaticHosts,
     has_policy_local: bool,
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
     reserved: Option<&ReservedDestination>,
@@ -925,6 +932,7 @@ async fn preauthorize_transparent_open(
         host: &host,
         port: destination.port(),
         sandbox_entrypoint_pid: 0,
+        static_hosts,
         plan,
     })
     .instrument(egress::resolve_span(&connect_span))
@@ -2552,6 +2560,7 @@ async fn handle_tcp_connection(
     agent_proposals: openshell_core::proposals::AgentProposals,
     backend_host_gateway: Arc<Option<IpAddr>>,
     trusted_host_gateway: Arc<Option<IpAddr>>,
+    static_hosts: Arc<openshell_isolation_interface::static_hosts::StaticHosts>,
     upstream_proxy: Arc<Option<UpstreamProxyConfig>>,
     provider_credentials: Option<ProviderCredentialState>,
     secret_resolver: Option<Arc<SecretResolver>>,
@@ -2575,6 +2584,7 @@ async fn handle_tcp_connection(
         agent_proposals,
         backend_host_gateway,
         trusted_host_gateway,
+        static_hosts,
         upstream_proxy,
         provider_credentials,
         secret_resolver,
@@ -2640,6 +2650,7 @@ async fn handle_mediated_connection(
     agent_proposals: openshell_core::proposals::AgentProposals,
     backend_host_gateway: Arc<Option<IpAddr>>,
     trusted_host_gateway: Arc<Option<IpAddr>>,
+    static_hosts: Arc<openshell_isolation_interface::static_hosts::StaticHosts>,
     upstream_proxy: Arc<Option<UpstreamProxyConfig>>,
     provider_credentials: Option<ProviderCredentialState>,
     secret_resolver: Option<Arc<SecretResolver>>,
@@ -2822,6 +2833,7 @@ async fn handle_mediated_connection(
             agent_proposals,
             backend_host_gateway,
             trusted_host_gateway,
+            static_hosts,
             provider_credentials,
             secret_resolver,
             denial_tx.as_ref(),
@@ -3036,6 +3048,7 @@ async fn handle_mediated_connection(
             host: &raw_host,
             port,
             sandbox_entrypoint_pid,
+            static_hosts: &static_hosts,
             plan: destination_plan,
         })
         .instrument(egress::resolve_span(&connect_span))
@@ -4396,15 +4409,22 @@ async fn resolve_and_check_trusted_gateway(
     port: u16,
     trusted_gw: IpAddr,
     entrypoint_pid: u32,
+    static_hosts: &openshell_isolation_interface::static_hosts::StaticHosts,
 ) -> std::result::Result<Vec<SocketAddr>, DestinationCheckError> {
     if BLOCKED_CONTROL_PLANE_PORTS.contains(&port) {
         return Err(DestinationCheckError::Denied(format!(
             "port {port} is a blocked control-plane port, connection rejected"
         )));
     }
-    let addrs = resolve_socket_addrs(host, port, entrypoint_pid, AddressBinding::IpConstrained)
-        .await
-        .map_err(DestinationCheckError::Resolution)?;
+    let addrs = resolve_socket_addrs(
+        host,
+        port,
+        entrypoint_pid,
+        AddressBinding::IpConstrained,
+        static_hosts,
+    )
+    .await
+    .map_err(DestinationCheckError::Resolution)?;
     if addrs.is_empty() {
         return Err(DestinationCheckError::Resolution(format!(
             "DNS resolution returned no addresses for {}",
@@ -4573,9 +4593,17 @@ async fn resolve_socket_addrs(
     port: u16,
     entrypoint_pid: u32,
     address_binding: AddressBinding,
+    static_hosts: &openshell_isolation_interface::static_hosts::StaticHosts,
 ) -> std::result::Result<Vec<SocketAddr>, String> {
     if let Some(addrs) = resolve_ip_literal(host, port) {
         return Ok(addrs);
+    }
+
+    if let Some(addresses) = static_hosts.lookup(host) {
+        return Ok(addresses
+            .iter()
+            .map(|address| SocketAddr::new(*address, port))
+            .collect());
     }
 
     let sandbox_hosts = if address_binding.allows_sandbox_hosts() {
@@ -4782,8 +4810,9 @@ async fn dial_transparent_upstream(
 async fn resolve_and_reject_internal(
     host: &str,
     port: u16,
+    static_hosts: &openshell_isolation_interface::static_hosts::StaticHosts,
 ) -> std::result::Result<Vec<SocketAddr>, DestinationCheckError> {
-    let addrs = resolve_socket_addrs(host, port, 0, AddressBinding::NameAuthorized)
+    let addrs = resolve_socket_addrs(host, port, 0, AddressBinding::NameAuthorized, static_hosts)
         .await
         .map_err(DestinationCheckError::Resolution)?;
     reject_internal_resolved_addrs(host, &addrs).map_err(DestinationCheckError::Denied)?;
@@ -4803,10 +4832,17 @@ async fn resolve_and_check_allowed_ips(
     port: u16,
     allowed_ips: &[ipnet::IpNet],
     entrypoint_pid: u32,
+    static_hosts: &openshell_isolation_interface::static_hosts::StaticHosts,
 ) -> std::result::Result<Vec<SocketAddr>, DestinationCheckError> {
-    let addrs = resolve_socket_addrs(host, port, entrypoint_pid, AddressBinding::IpConstrained)
-        .await
-        .map_err(DestinationCheckError::Resolution)?;
+    let addrs = resolve_socket_addrs(
+        host,
+        port,
+        entrypoint_pid,
+        AddressBinding::IpConstrained,
+        static_hosts,
+    )
+    .await
+    .map_err(DestinationCheckError::Resolution)?;
     validate_allowed_ips_for_resolved_addrs(host, port, &addrs, allowed_ips)
         .map_err(DestinationCheckError::Denied)?;
     Ok(addrs)
@@ -4823,8 +4859,9 @@ async fn resolve_and_check_allowed_ips(
 async fn resolve_and_check_declared_endpoint(
     host: &str,
     port: u16,
+    static_hosts: &openshell_isolation_interface::static_hosts::StaticHosts,
 ) -> std::result::Result<Vec<SocketAddr>, DestinationCheckError> {
-    let addrs = resolve_socket_addrs(host, port, 0, AddressBinding::NameAuthorized)
+    let addrs = resolve_socket_addrs(host, port, 0, AddressBinding::NameAuthorized, static_hosts)
         .await
         .map_err(DestinationCheckError::Resolution)?;
     validate_declared_endpoint_resolved_addrs(host, port, &addrs)
@@ -5574,6 +5611,7 @@ async fn handle_forward_proxy(
     agent_proposals: openshell_core::proposals::AgentProposals,
     backend_host_gateway: Arc<Option<IpAddr>>,
     trusted_host_gateway: Arc<Option<IpAddr>>,
+    static_hosts: Arc<openshell_isolation_interface::static_hosts::StaticHosts>,
     provider_credentials: Option<ProviderCredentialState>,
     secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
@@ -5596,6 +5634,7 @@ async fn handle_forward_proxy(
             agent_proposals,
             backend_host_gateway,
             trusted_host_gateway,
+            static_hosts,
             provider_credentials,
             secret_resolver,
             denial_tx,
@@ -5622,6 +5661,7 @@ async fn handle_forward_proxy_inner(
     agent_proposals: openshell_core::proposals::AgentProposals,
     backend_host_gateway: Arc<Option<IpAddr>>,
     trusted_host_gateway: Arc<Option<IpAddr>>,
+    static_hosts: Arc<openshell_isolation_interface::static_hosts::StaticHosts>,
     provider_credentials: Option<ProviderCredentialState>,
     secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
@@ -6534,6 +6574,7 @@ async fn handle_forward_proxy_inner(
         host: &raw_host,
         port,
         sandbox_entrypoint_pid,
+        static_hosts: &static_hosts,
         plan: destination_plan,
     })
     .instrument(resolve_span.clone())
@@ -8084,6 +8125,7 @@ process:
                 &identity_cache,
                 None,
                 None,
+                &openshell_isolation_interface::static_hosts::StaticHosts::default(),
                 false,
                 Some(&denial_tx),
                 None,
@@ -8102,6 +8144,7 @@ process:
                 &identity_cache,
                 None,
                 None,
+                &openshell_isolation_interface::static_hosts::StaticHosts::default(),
                 false,
                 Some(&denial_tx),
                 None,
@@ -8127,6 +8170,7 @@ process:
                 &identity_cache,
                 None,
                 None,
+                &openshell_isolation_interface::static_hosts::StaticHosts::default(),
                 false,
                 Some(&denial_tx),
                 None,
@@ -8319,6 +8363,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                 AgentProposals::default(),
                 Arc::new(None),
                 Arc::new(None),
+                Arc::new(openshell_isolation_interface::static_hosts::StaticHosts::default()),
                 Arc::new(None),
                 Some(credentials),
                 None,
@@ -8418,6 +8463,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                 &BinaryIdentityCache::new(),
                 None,
                 None,
+                &openshell_isolation_interface::static_hosts::StaticHosts::default(),
                 false,
                 None,
                 None,
@@ -8464,6 +8510,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             &BinaryIdentityCache::new(),
             None,
             None,
+            &openshell_isolation_interface::static_hosts::StaticHosts::default(),
             false,
             None,
             None,
@@ -8595,6 +8642,7 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
                         &BinaryIdentityCache::new(),
                         None,
                         None,
+                        &openshell_isolation_interface::static_hosts::StaticHosts::default(),
                         false,
                         None,
                         None,
@@ -8657,6 +8705,7 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
                 &BinaryIdentityCache::new(),
                 None,
                 None,
+                &openshell_isolation_interface::static_hosts::StaticHosts::default(),
                 false,
                 Some(&denial_tx),
                 None,
@@ -8700,6 +8749,7 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
                     identity_cache,
                     None,
                     None,
+                    &openshell_isolation_interface::static_hosts::StaticHosts::default(),
                     false,
                     Some(denial_tx),
                     None,
@@ -8883,7 +8933,16 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
             decision,
         };
         let (stream, supplied_identity, socket_addrs, transparent) = preauthorize_transparent_open(
-            pending, None, &engine, &cache, None, None, true, None, None,
+            pending,
+            None,
+            &engine,
+            &cache,
+            None,
+            None,
+            &openshell_isolation_interface::static_hosts::StaticHosts::default(),
+            true,
+            None,
+            None,
         )
         .await
         .expect("sandbox-local open is admitted");
@@ -8915,6 +8974,7 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
             proposals,
             Arc::new(None),
             Arc::new(None),
+            Arc::new(openshell_isolation_interface::static_hosts::StaticHosts::default()),
             Arc::new(None),
             None,
             None,
@@ -9017,7 +9077,16 @@ network_policies:
             decision,
         };
         let (stream, supplied_identity, socket_addrs, transparent) = preauthorize_transparent_open(
-            pending, None, &engine, &cache, None, None, false, None, None,
+            pending,
+            None,
+            &engine,
+            &cache,
+            None,
+            None,
+            &openshell_isolation_interface::static_hosts::StaticHosts::default(),
+            false,
+            None,
+            None,
         )
         .await
         .expect("open is admitted");
@@ -9046,6 +9115,7 @@ network_policies:
             AgentProposals::new(true),
             Arc::new(None),
             Arc::new(None),
+            Arc::new(openshell_isolation_interface::static_hosts::StaticHosts::default()),
             Arc::new(None),
             None,
             None,
@@ -9170,6 +9240,7 @@ process:
                 &identity_cache,
                 None,
                 None,
+                &openshell_isolation_interface::static_hosts::StaticHosts::default(),
                 false,
                 None,
                 None,
@@ -9256,6 +9327,7 @@ process:
                 &identity_cache,
                 None,
                 None,
+                &openshell_isolation_interface::static_hosts::StaticHosts::default(),
                 false,
                 None,
                 None,
@@ -9402,6 +9474,7 @@ process:
                     &BinaryIdentityCache::new(),
                     None,
                     None,
+                    &openshell_isolation_interface::static_hosts::StaticHosts::default(),
                     false,
                     None,
                     Some(&reserved)
@@ -9442,6 +9515,7 @@ process:
                 &BinaryIdentityCache::new(),
                 None,
                 None,
+                &openshell_isolation_interface::static_hosts::StaticHosts::default(),
                 false,
                 None,
                 Some(&reserved)
@@ -9472,6 +9546,7 @@ process:
                 &BinaryIdentityCache::new(),
                 None,
                 None,
+                &openshell_isolation_interface::static_hosts::StaticHosts::default(),
                 false,
                 None,
                 None
@@ -9529,6 +9604,7 @@ process:
                     &BinaryIdentityCache::new(),
                     None,
                     None,
+                    &openshell_isolation_interface::static_hosts::StaticHosts::default(),
                     false,
                     None,
                     None
@@ -9566,6 +9642,7 @@ process:
                 &BinaryIdentityCache::new(),
                 None,
                 None,
+                &openshell_isolation_interface::static_hosts::StaticHosts::default(),
                 false,
                 None,
                 Some(&reserved)
@@ -9590,6 +9667,7 @@ process:
                 &BinaryIdentityCache::new(),
                 None,
                 None,
+                &openshell_isolation_interface::static_hosts::StaticHosts::default(),
                 false,
                 None,
                 Some(&reserved)
@@ -9965,6 +10043,7 @@ network_policies: {}
             AgentProposals::default(),
             Arc::new(None),
             Arc::new(None),
+            Arc::new(openshell_isolation_interface::static_hosts::StaticHosts::default()),
             Arc::new(None),
             None,
             None,
@@ -10004,6 +10083,7 @@ network_policies: {}
             ready_rx,
             &upstream_proxy::UpstreamProxyArgs::default(),
             None,
+            openshell_isolation_interface::static_hosts::StaticHosts::default(),
             Some(rpc_test::network(Arc::new(FailedMediationSource))),
             None,
             None,
@@ -10095,6 +10175,7 @@ network_policies:
                         Some(("192.0.2.20:42123".parse().unwrap(), "192.0.2.10:3128".parse().unwrap())),
                         engine, Arc::new(BinaryIdentityCache::new()), Arc::new(AtomicU32::new(0)),
                         None, AgentProposals::default(), Arc::new(None), Arc::new(None),
+                        Arc::new(openshell_isolation_interface::static_hosts::StaticHosts::default()),
                         None, None, None, None, None,
                     )).await;
                     drop(proxy);
@@ -10323,6 +10404,7 @@ network_policies:
                     AgentProposals::default(),
                     Arc::new(None),
                     Arc::new(None),
+                    Arc::new(openshell_isolation_interface::static_hosts::StaticHosts::default()),
                     None,
                     None,
                     None,
@@ -10454,6 +10536,7 @@ network_policies:
                 AgentProposals::default(),
                 Arc::new(None),
                 Arc::new(None),
+                Arc::new(openshell_isolation_interface::static_hosts::StaticHosts::default()),
                 None,
                 None,
                 None,
@@ -10572,6 +10655,7 @@ network_policies:
                 AgentProposals::default(),
                 Arc::new(None),
                 Arc::new(None),
+                Arc::new(openshell_isolation_interface::static_hosts::StaticHosts::default()),
                 None,
                 None,
                 None,
@@ -10699,6 +10783,7 @@ network_policies:
                 AgentProposals::default(),
                 Arc::new(None),
                 Arc::new(None),
+                Arc::new(openshell_isolation_interface::static_hosts::StaticHosts::default()),
                 None,
                 None,
                 None,
@@ -10841,6 +10926,7 @@ network_policies:
                 AgentProposals::default(),
                 Arc::new(None),
                 Arc::new(None),
+                Arc::new(openshell_isolation_interface::static_hosts::StaticHosts::default()),
                 None,
                 None,
                 None,
@@ -13128,6 +13214,62 @@ network_policies:
         assert!(!is_internal_ip(IpAddr::V6(v6)));
     }
 
+    // -- static hosts --
+
+    fn static_hosts(
+        entries: &[(&str, &str)],
+    ) -> openshell_isolation_interface::static_hosts::StaticHosts {
+        openshell_isolation_interface::static_hosts::StaticHosts::from_entries(
+            entries
+                .iter()
+                .map(|(name, address)| (*name, address.parse::<IpAddr>().unwrap())),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn static_host_resolves_without_dns() {
+        let hosts = static_hosts(&[("maas.invalid", "150.239.114.201")]);
+        let addrs = resolve_and_reject_internal("MAAS.invalid.", 443, &hosts)
+            .await
+            .unwrap();
+        assert_eq!(
+            addrs,
+            ["150.239.114.201:443".parse::<SocketAddr>().unwrap()]
+        );
+    }
+
+    #[tokio::test]
+    async fn static_host_private_address_is_still_rejected_by_default() {
+        let hosts = static_hosts(&[("db.invalid", "10.9.9.9")]);
+        let result = resolve_and_reject_internal("db.invalid", 5432, &hosts).await;
+        assert!(matches!(result, Err(DestinationCheckError::Denied(_))));
+    }
+
+    #[tokio::test]
+    async fn static_host_private_address_is_allowed_for_a_declared_endpoint() {
+        let hosts = static_hosts(&[("db.invalid", "10.9.9.9")]);
+        let addrs = resolve_and_check_declared_endpoint("db.invalid", 5432, &hosts)
+            .await
+            .unwrap();
+        assert_eq!(addrs, ["10.9.9.9:5432".parse::<SocketAddr>().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn static_host_address_must_match_allowed_ips() {
+        let hosts = static_hosts(&[("db.invalid", "10.9.9.9")]);
+        let allowed = ["10.0.0.0/24".parse::<ipnet::IpNet>().unwrap()];
+        let result = resolve_and_check_allowed_ips("db.invalid", 5432, &allowed, 0, &hosts).await;
+        assert!(matches!(result, Err(DestinationCheckError::Denied(_))));
+    }
+
+    #[tokio::test]
+    async fn static_host_does_not_answer_other_names() {
+        let hosts = static_hosts(&[("maas.invalid", "150.239.114.201")]);
+        let result = resolve_and_reject_internal("other.maas.invalid", 443, &hosts).await;
+        assert!(matches!(result, Err(DestinationCheckError::Resolution(_))));
+    }
+
     // -- resolve_and_reject_internal --
 
     #[tokio::test]
@@ -13636,6 +13778,7 @@ network_policies:
             6443,
             IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2)),
             0,
+            &openshell_isolation_interface::static_hosts::StaticHosts::default(),
         )
         .await;
         assert!(result.is_err());
@@ -13649,9 +13792,14 @@ network_policies:
     async fn test_trusted_gateway_rejects_all_control_plane_ports() {
         let trusted_gw = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2));
         for &port in BLOCKED_CONTROL_PLANE_PORTS {
-            let result =
-                resolve_and_check_trusted_gateway("host.openshell.internal", port, trusted_gw, 0)
-                    .await;
+            let result = resolve_and_check_trusted_gateway(
+                "host.openshell.internal",
+                port,
+                trusted_gw,
+                0,
+                &openshell_isolation_interface::static_hosts::StaticHosts::default(),
+            )
+            .await;
             assert!(
                 result.is_err(),
                 "port {port} should be blocked by control-plane guard"
@@ -13670,7 +13818,14 @@ network_policies:
         // Using an IP literal as the host bypasses DNS and gives a deterministic
         // resolved address, allowing us to exercise the actual function.
         let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let result = resolve_and_check_trusted_gateway("127.0.0.1", 8080, loopback, 0).await;
+        let result = resolve_and_check_trusted_gateway(
+            "127.0.0.1",
+            8080,
+            loopback,
+            0,
+            &openshell_isolation_interface::static_hosts::StaticHosts::default(),
+        )
+        .await;
         assert!(result.is_err(), "loopback must be rejected");
         let err = result.unwrap_err();
         assert!(
@@ -13684,7 +13839,14 @@ network_policies:
         // Defense-in-depth: 0.0.0.0 as trusted_gw must be rejected.
         // IP literal resolves to 0.0.0.0 directly, bypassing DNS.
         let unspecified = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
-        let result = resolve_and_check_trusted_gateway("0.0.0.0", 8080, unspecified, 0).await;
+        let result = resolve_and_check_trusted_gateway(
+            "0.0.0.0",
+            8080,
+            unspecified,
+            0,
+            &openshell_isolation_interface::static_hosts::StaticHosts::default(),
+        )
+        .await;
         assert!(result.is_err(), "unspecified must be rejected");
         let err = result.unwrap_err();
         assert!(
@@ -13699,7 +13861,14 @@ network_policies:
         // guard fires. This exercises the full resolution→validation path.
         let trusted_gw = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2));
         let other_ip = "10.0.0.1"; // RFC1918, resolves as a literal
-        let result = resolve_and_check_trusted_gateway(other_ip, 8080, trusted_gw, 0).await;
+        let result = resolve_and_check_trusted_gateway(
+            other_ip,
+            8080,
+            trusted_gw,
+            0,
+            &openshell_isolation_interface::static_hosts::StaticHosts::default(),
+        )
+        .await;
         assert!(result.is_err(), "IP mismatch must be rejected");
         let err = result.unwrap_err();
         assert!(
@@ -13714,7 +13883,14 @@ network_policies:
         // it matches trusted_gw (which detect_trusted_host_gateway prevents,
         // but this is the defense-in-depth layer).
         let metadata = IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254));
-        let result = resolve_and_check_trusted_gateway("169.254.169.254", 80, metadata, 0).await;
+        let result = resolve_and_check_trusted_gateway(
+            "169.254.169.254",
+            80,
+            metadata,
+            0,
+            &openshell_isolation_interface::static_hosts::StaticHosts::default(),
+        )
+        .await;
         assert!(result.is_err(), "cloud metadata IP must be rejected");
         let err = result.unwrap_err();
         assert!(
@@ -13730,7 +13906,14 @@ network_policies:
         // detect_trusted_host_gateway() already blocks these via !is_link_local_ip(),
         // but resolve_and_check_trusted_gateway() must enforce the same invariant.
         let docker_bridge = IpAddr::V4(Ipv4Addr::new(172, 17, 0, 1));
-        let result = resolve_and_check_trusted_gateway("172.17.0.1", 8080, docker_bridge, 0).await;
+        let result = resolve_and_check_trusted_gateway(
+            "172.17.0.1",
+            8080,
+            docker_bridge,
+            0,
+            &openshell_isolation_interface::static_hosts::StaticHosts::default(),
+        )
+        .await;
         assert!(result.is_err(), "private RFC 1918 IP must be rejected");
         let err = result.unwrap_err();
         assert!(
@@ -13741,7 +13924,12 @@ network_policies:
 
     #[tokio::test]
     async fn test_rejects_localhost_resolution() {
-        let result = resolve_and_reject_internal("localhost", 80).await;
+        let result = resolve_and_reject_internal(
+            "localhost",
+            80,
+            &openshell_isolation_interface::static_hosts::StaticHosts::default(),
+        )
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -13752,7 +13940,12 @@ network_policies:
 
     #[tokio::test]
     async fn test_rejects_loopback_ip_literal() {
-        let result = resolve_and_reject_internal("127.0.0.1", 443).await;
+        let result = resolve_and_reject_internal(
+            "127.0.0.1",
+            443,
+            &openshell_isolation_interface::static_hosts::StaticHosts::default(),
+        )
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -13763,7 +13956,12 @@ network_policies:
 
     #[tokio::test]
     async fn test_rejects_metadata_ip() {
-        let result = resolve_and_reject_internal("169.254.169.254", 80).await;
+        let result = resolve_and_reject_internal(
+            "169.254.169.254",
+            80,
+            &openshell_isolation_interface::static_hosts::StaticHosts::default(),
+        )
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -13774,7 +13972,12 @@ network_policies:
 
     #[tokio::test]
     async fn test_dns_failure_returns_error() {
-        let result = resolve_and_reject_internal("this-host-does-not-exist.invalid", 80).await;
+        let result = resolve_and_reject_internal(
+            "this-host-does-not-exist.invalid",
+            80,
+            &openshell_isolation_interface::static_hosts::StaticHosts::default(),
+        )
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -13910,7 +14113,14 @@ network_policies:
     async fn test_resolve_check_allowed_ips_blocks_loopback() {
         // Construct nets directly (parse_allowed_ips now rejects always-blocked).
         let nets = vec!["127.0.0.0/8".parse::<ipnet::IpNet>().unwrap()];
-        let result = resolve_and_check_allowed_ips("127.0.0.1", 80, &nets, 0).await;
+        let result = resolve_and_check_allowed_ips(
+            "127.0.0.1",
+            80,
+            &nets,
+            0,
+            &openshell_isolation_interface::static_hosts::StaticHosts::default(),
+        )
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -13923,7 +14133,14 @@ network_policies:
     async fn test_resolve_check_allowed_ips_blocks_metadata() {
         // Construct nets directly (parse_allowed_ips now rejects always-blocked).
         let nets = vec!["169.254.0.0/16".parse::<ipnet::IpNet>().unwrap()];
-        let result = resolve_and_check_allowed_ips("169.254.169.254", 80, &nets, 0).await;
+        let result = resolve_and_check_allowed_ips(
+            "169.254.169.254",
+            80,
+            &nets,
+            0,
+            &openshell_isolation_interface::static_hosts::StaticHosts::default(),
+        )
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -13936,7 +14153,14 @@ network_policies:
     async fn test_resolve_check_allowed_ips_blocks_unspecified() {
         // Construct nets directly (parse_allowed_ips now rejects always-blocked).
         let nets = vec!["0.0.0.0/0".parse::<ipnet::IpNet>().unwrap()];
-        let result = resolve_and_check_allowed_ips("0.0.0.0", 80, &nets, 0).await;
+        let result = resolve_and_check_allowed_ips(
+            "0.0.0.0",
+            80,
+            &nets,
+            0,
+            &openshell_isolation_interface::static_hosts::StaticHosts::default(),
+        )
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -13949,7 +14173,14 @@ network_policies:
     async fn test_resolve_check_allowed_ips_rejects_outside_allowlist() {
         // 8.8.8.8 resolves to a public IP which is NOT in 10.0.0.0/8
         let nets = parse_allowed_ips(&["10.0.0.0/8".to_string()]).unwrap();
-        let result = resolve_and_check_allowed_ips("dns.google", 443, &nets, 0).await;
+        let result = resolve_and_check_allowed_ips(
+            "dns.google",
+            443,
+            &nets,
+            0,
+            &openshell_isolation_interface::static_hosts::StaticHosts::default(),
+        )
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -13965,17 +14196,38 @@ network_policies:
         // Use a public CIDR (parse_allowed_ips now rejects 0.0.0.0/0).
         let nets = parse_allowed_ips(&["8.8.8.0/24".to_string()]).unwrap();
         // K8s API server port
-        let result = resolve_and_check_allowed_ips("8.8.8.8", 6443, &nets, 0).await;
+        let result = resolve_and_check_allowed_ips(
+            "8.8.8.8",
+            6443,
+            &nets,
+            0,
+            &openshell_isolation_interface::static_hosts::StaticHosts::default(),
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("blocked control-plane port"));
 
         // etcd client port
-        let result = resolve_and_check_allowed_ips("8.8.8.8", 2379, &nets, 0).await;
+        let result = resolve_and_check_allowed_ips(
+            "8.8.8.8",
+            2379,
+            &nets,
+            0,
+            &openshell_isolation_interface::static_hosts::StaticHosts::default(),
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("blocked control-plane port"));
 
         // kubelet API port
-        let result = resolve_and_check_allowed_ips("8.8.8.8", 10250, &nets, 0).await;
+        let result = resolve_and_check_allowed_ips(
+            "8.8.8.8",
+            10250,
+            &nets,
+            0,
+            &openshell_isolation_interface::static_hosts::StaticHosts::default(),
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("blocked control-plane port"));
     }
@@ -13984,7 +14236,14 @@ network_policies:
     async fn test_resolve_check_allowed_ips_allows_non_control_plane_ports() {
         // Port 443 should not be blocked by the control-plane port list
         let nets = parse_allowed_ips(&["8.8.8.0/24".to_string()]).unwrap();
-        let result = resolve_and_check_allowed_ips("8.8.8.8", 443, &nets, 0).await;
+        let result = resolve_and_check_allowed_ips(
+            "8.8.8.8",
+            443,
+            &nets,
+            0,
+            &openshell_isolation_interface::static_hosts::StaticHosts::default(),
+        )
+        .await;
         assert!(result.is_ok());
     }
 
@@ -15466,7 +15725,12 @@ network_policies:
     async fn test_forward_public_ip_allowed_without_allowed_ips() {
         // Public IPs (e.g. dns.google -> 8.8.8.8) should pass through
         // resolve_and_reject_internal without needing allowed_ips.
-        let result = resolve_and_reject_internal("dns.google", 80).await;
+        let result = resolve_and_reject_internal(
+            "dns.google",
+            80,
+            &openshell_isolation_interface::static_hosts::StaticHosts::default(),
+        )
+        .await;
         assert!(
             result.is_ok(),
             "Public IP should be allowed without allowed_ips: {result:?}"
@@ -15486,7 +15750,12 @@ network_policies:
     #[tokio::test]
     async fn test_forward_private_ip_rejected_without_allowed_ips() {
         // Private IP literals should be rejected by resolve_and_reject_internal.
-        let result = resolve_and_reject_internal("10.0.0.1", 80).await;
+        let result = resolve_and_reject_internal(
+            "10.0.0.1",
+            80,
+            &openshell_isolation_interface::static_hosts::StaticHosts::default(),
+        )
+        .await;
         assert!(
             result.is_err(),
             "Private IP should be rejected without allowed_ips"
@@ -15502,7 +15771,14 @@ network_policies:
     async fn test_forward_private_ip_accepted_with_allowed_ips() {
         // Private IP with matching allowed_ips should pass through.
         let nets = parse_allowed_ips(&["10.0.0.0/8".to_string()]).unwrap();
-        let result = resolve_and_check_allowed_ips("10.0.0.1", 80, &nets, 0).await;
+        let result = resolve_and_check_allowed_ips(
+            "10.0.0.1",
+            80,
+            &nets,
+            0,
+            &openshell_isolation_interface::static_hosts::StaticHosts::default(),
+        )
+        .await;
         assert!(
             result.is_ok(),
             "Private IP with matching allowed_ips should be accepted: {result:?}"
@@ -15513,7 +15789,14 @@ network_policies:
     async fn test_forward_private_ip_rejected_with_wrong_allowed_ips() {
         // Private IP not in allowed_ips should be rejected.
         let nets = parse_allowed_ips(&["192.168.0.0/16".to_string()]).unwrap();
-        let result = resolve_and_check_allowed_ips("10.0.0.1", 80, &nets, 0).await;
+        let result = resolve_and_check_allowed_ips(
+            "10.0.0.1",
+            80,
+            &nets,
+            0,
+            &openshell_isolation_interface::static_hosts::StaticHosts::default(),
+        )
+        .await;
         assert!(
             result.is_err(),
             "Private IP not in allowed_ips should be rejected"
@@ -15530,7 +15813,14 @@ network_policies:
         // Loopback addresses are always blocked, even if in allowed_ips.
         // Construct nets directly (parse_allowed_ips now rejects always-blocked).
         let nets = vec!["127.0.0.0/8".parse::<ipnet::IpNet>().unwrap()];
-        let result = resolve_and_check_allowed_ips("127.0.0.1", 80, &nets, 0).await;
+        let result = resolve_and_check_allowed_ips(
+            "127.0.0.1",
+            80,
+            &nets,
+            0,
+            &openshell_isolation_interface::static_hosts::StaticHosts::default(),
+        )
+        .await;
         assert!(result.is_err(), "Loopback should be always blocked");
         let err = result.unwrap_err();
         assert!(
@@ -15544,7 +15834,14 @@ network_policies:
         // Link-local / cloud metadata addresses are always blocked.
         // Construct nets directly (parse_allowed_ips now rejects always-blocked).
         let nets = vec!["169.254.0.0/16".parse::<ipnet::IpNet>().unwrap()];
-        let result = resolve_and_check_allowed_ips("169.254.169.254", 80, &nets, 0).await;
+        let result = resolve_and_check_allowed_ips(
+            "169.254.169.254",
+            80,
+            &nets,
+            0,
+            &openshell_isolation_interface::static_hosts::StaticHosts::default(),
+        )
+        .await;
         assert!(result.is_err(), "Link-local should be always blocked");
         let err = result.unwrap_err();
         assert!(
@@ -15557,7 +15854,12 @@ network_policies:
 
     #[tokio::test]
     async fn test_resolve_reject_internal_fails_closed_on_nul_hostname() {
-        let result = resolve_and_reject_internal("evil.com\0.safe.com", 443).await;
+        let result = resolve_and_reject_internal(
+            "evil.com\0.safe.com",
+            443,
+            &openshell_isolation_interface::static_hosts::StaticHosts::default(),
+        )
+        .await;
         assert!(
             result.is_err(),
             "NUL-containing hostname should fail DNS resolution (fail closed)"
@@ -15568,7 +15870,14 @@ network_policies:
     async fn test_resolve_allowed_ips_fails_closed_on_nul_hostname() {
         let nets = parse_allowed_ips(&["0.0.0.0/0".to_string()])
             .unwrap_or_else(|_| vec!["0.0.0.0/0".parse::<ipnet::IpNet>().unwrap()]);
-        let result = resolve_and_check_allowed_ips("evil.com\0.safe.com", 443, &nets, 0).await;
+        let result = resolve_and_check_allowed_ips(
+            "evil.com\0.safe.com",
+            443,
+            &nets,
+            0,
+            &openshell_isolation_interface::static_hosts::StaticHosts::default(),
+        )
+        .await;
         assert!(
             result.is_err(),
             "NUL-containing hostname should fail DNS resolution (fail closed)"
@@ -15841,12 +16150,13 @@ network_policies:
                 AgentProposals::default(), // agent_proposals
                 Arc::new(None),            // backend_host_gateway
                 Arc::new(None),            // trusted_host_gateway
-                Arc::new(None),            // upstream_proxy
-                None,                      // provider_credentials
-                None,                      // secret_resolver
-                Some(denial_tx),           // denial_tx — positive allow/deny signal
-                None,                      // activity_tx
-                None,                      // endpoint_observation_tx
+                Arc::new(openshell_isolation_interface::static_hosts::StaticHosts::default()), // static_hosts
+                Arc::new(None),  // upstream_proxy
+                None,            // provider_credentials
+                None,            // secret_resolver
+                Some(denial_tx), // denial_tx — positive allow/deny signal
+                None,            // activity_tx
+                None,            // endpoint_observation_tx
             )),
         )
         .await
@@ -15912,6 +16222,7 @@ network_policies:
             AgentProposals::default(),
             Arc::new(None),
             Arc::new(None),
+            Arc::new(openshell_isolation_interface::static_hosts::StaticHosts::default()),
             Arc::new(None),
             None,
             None,

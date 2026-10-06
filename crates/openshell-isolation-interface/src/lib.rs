@@ -36,3 +36,4 @@ pub struct AgentSpec {
 }
 
 pub mod contract;
+pub mod static_hosts;
