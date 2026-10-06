@@ -509,6 +509,7 @@ pub async fn run_network_proxy(
         &upstream_proxy_args,
         Some(&tls_dir.path),
         None,
+        openshell_isolation_interface::static_hosts::StaticHosts::default(),
         #[cfg(target_os = "linux")]
         None,
         None,
@@ -858,6 +859,7 @@ pub async fn run_sandbox(
 
     let remote_network_source = remote_boundary.0.network_mediation_source();
     let remote_host_gateway_ip = remote_boundary.0.host_gateway_ip();
+    let remote_static_hosts = remote_boundary.0.static_hosts();
     let (remote_ready, backend_name, ca_file_paths) = {
         let (bound, backend_name, ca_file_paths) = remote_boundary;
         let ready = bound
@@ -892,6 +894,7 @@ pub async fn run_sandbox(
             &upstream_proxy_args,
             None,
             remote_host_gateway_ip,
+            remote_static_hosts,
             #[cfg(target_os = "linux")]
             None,
             Some(remote_network_source),

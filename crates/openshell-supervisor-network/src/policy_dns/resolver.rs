@@ -307,6 +307,50 @@ fn canonical_name(name: &Name) -> String {
     name.to_ascii().trim_end_matches('.').to_ascii_lowercase()
 }
 
+/// Answers driver-supplied static hosts from the table and delegates every
+/// other name to `inner`.
+pub(crate) struct StaticHostResolver<R> {
+    static_hosts: openshell_isolation_interface::static_hosts::StaticHosts,
+    inner: R,
+}
+
+impl<R> StaticHostResolver<R> {
+    pub(crate) fn new(
+        static_hosts: openshell_isolation_interface::static_hosts::StaticHosts,
+        inner: R,
+    ) -> Self {
+        Self {
+            static_hosts,
+            inner,
+        }
+    }
+}
+
+impl<R: TrustedResolver> TrustedResolver for StaticHostResolver<R> {
+    async fn resolve(
+        &self,
+        name: &NormalizedName,
+        family: AddressFamily,
+    ) -> Result<TrustedAnswer, ResolveError> {
+        let Some(addresses) = self.static_hosts.lookup(name.as_str()) else {
+            return self.inner.resolve(name, family).await;
+        };
+        let addresses: Vec<IpAddr> = addresses
+            .iter()
+            .copied()
+            .filter(|address| family.accepts(*address))
+            .take(MAX_RETAINED_ADDRESSES)
+            .collect();
+        if addresses.is_empty() {
+            return Err(ResolveError::NoData);
+        }
+        Ok(TrustedAnswer {
+            addresses,
+            ttl: crate::policy_dns::MAX_MAPPING_TTL,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,6 +563,62 @@ mod tests {
         assert!(matches!(
             parse_response(&vec![0; MAX_DNS_MESSAGE_BYTES + 1], 1, &query),
             Err(ResolveError::Oversized)
+        ));
+    }
+
+    fn silent_static_resolver(
+        entries: &[(&str, &str)],
+        server: SocketAddr,
+    ) -> StaticHostResolver<SocketTrustedResolver> {
+        let static_hosts = openshell_isolation_interface::static_hosts::StaticHosts::from_entries(
+            entries
+                .iter()
+                .map(|(name, address)| (*name, address.parse::<IpAddr>().unwrap())),
+        )
+        .unwrap();
+        StaticHostResolver::new(
+            static_hosts,
+            SocketTrustedResolver::with_timeout(server, Duration::from_millis(50)),
+        )
+    }
+
+    #[tokio::test]
+    async fn static_host_resolver_answers_listed_names_without_upstream() {
+        let (_udp, _tcp, server) = bind_dns_test_server().await;
+        let resolver = silent_static_resolver(
+            &[
+                ("maas.example", "150.239.114.201"),
+                ("maas.example", "2001:db8::1"),
+            ],
+            server,
+        );
+        let name = NormalizedName::parse("MAAS.example.").unwrap();
+        let v4 = resolver.resolve(&name, AddressFamily::Ipv4).await.unwrap();
+        assert_eq!(v4.addresses, ["150.239.114.201".parse::<IpAddr>().unwrap()]);
+        assert_eq!(v4.ttl, crate::policy_dns::MAX_MAPPING_TTL);
+        let v6 = resolver.resolve(&name, AddressFamily::Ipv6).await.unwrap();
+        assert_eq!(v6.addresses, ["2001:db8::1".parse::<IpAddr>().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn static_host_resolver_reports_no_data_for_a_missing_family() {
+        let (_udp, _tcp, server) = bind_dns_test_server().await;
+        let resolver = silent_static_resolver(&[("maas.example", "150.239.114.201")], server);
+        let name = NormalizedName::parse("maas.example").unwrap();
+        assert!(matches!(
+            resolver.resolve(&name, AddressFamily::Ipv6).await,
+            Err(ResolveError::NoData)
+        ));
+    }
+
+    #[tokio::test]
+    async fn static_host_resolver_delegates_unlisted_names() {
+        let (_udp, _tcp, server) = bind_dns_test_server().await;
+        let resolver = silent_static_resolver(&[("maas.example", "150.239.114.201")], server);
+        let name = NormalizedName::parse("other.example").unwrap();
+        assert!(matches!(
+            resolver.resolve(&name, AddressFamily::Ipv4).await,
+            Err(ResolveError::Timeout)
         ));
     }
 }
