@@ -210,6 +210,7 @@ pub struct KubernetesSandboxRuntimeBoundarySpec {
     pub sandbox_tls: SandboxTlsServerConfig,
     pub supervisor_tls: SandboxTlsClientConfig,
     pub host_gateway_ip: Option<IpAddr>,
+    pub static_hosts: openshell_isolation_interface::static_hosts::StaticHosts,
     pub workload_identity: ResolvedWorkloadIdentity,
     pub child_env: HashMap<String, String>,
 }
@@ -289,6 +290,7 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                 },
                 tls: self.supervisor_tls,
                 host_gateway_ip: self.host_gateway_ip,
+                static_hosts: self.static_hosts,
                 resource_claims,
                 outer_fence,
             },
@@ -374,6 +376,7 @@ mod tests {
                 trust_anchor_pem: "test-ca".to_string(),
             },
             host_gateway_ip: Some("10.42.0.1".parse().expect("valid gateway IP")),
+            static_hosts: openshell_isolation_interface::static_hosts::StaticHosts::default(),
             workload_identity: ResolvedWorkloadIdentity::new(
                 1000,
                 1000,

@@ -51,6 +51,7 @@ pub(crate) struct DestinationRequest<'a> {
     pub(crate) host: &'a str,
     pub(crate) port: u16,
     pub(crate) sandbox_entrypoint_pid: u32,
+    pub(crate) static_hosts: &'a openshell_isolation_interface::static_hosts::StaticHosts,
     pub(crate) plan: &'a DestinationValidationPlan,
 }
 
@@ -319,16 +320,23 @@ pub(crate) async fn validate_destination(
         host,
         port,
         sandbox_entrypoint_pid,
+        static_hosts,
         plan,
     } = request;
 
     let addrs = match &plan.address_authorization {
         AddressAuthorization::TrustedGatewayAlias { expected_ip } => {
-            resolve_and_check_trusted_gateway(host, port, *expected_ip, sandbox_entrypoint_pid)
-                .await
-                .map_err(|error| {
-                    DestinationDenial::from_check(error, DestinationDenialKind::TrustedGateway)
-                })?
+            resolve_and_check_trusted_gateway(
+                host,
+                port,
+                *expected_ip,
+                sandbox_entrypoint_pid,
+                static_hosts,
+            )
+            .await
+            .map_err(|error| {
+                DestinationDenial::from_check(error, DestinationDenialKind::TrustedGateway)
+            })?
         }
         AddressAuthorization::BackendPinnedGateway(ip) => {
             if BLOCKED_CONTROL_PLANE_PORTS.contains(&port) {
@@ -347,30 +355,38 @@ pub(crate) async fn validate_destination(
             }
             vec![SocketAddr::new(*ip, port)]
         }
-        AddressAuthorization::ExplicitAllowedIps(networks) => {
-            resolve_and_check_allowed_ips(host, port, networks, sandbox_entrypoint_pid)
-                .await
-                .map_err(|error| {
-                    DestinationDenial::from_check(error, DestinationDenialKind::AllowedIps)
-                })?
-        }
+        AddressAuthorization::ExplicitAllowedIps(networks) => resolve_and_check_allowed_ips(
+            host,
+            port,
+            networks,
+            sandbox_entrypoint_pid,
+            static_hosts,
+        )
+        .await
+        .map_err(|error| DestinationDenial::from_check(error, DestinationDenialKind::AllowedIps))?,
         AddressAuthorization::ImplicitIpLiteral(ip) => {
             let network = IpNet::from(*ip);
-            resolve_and_check_allowed_ips(host, port, &[network], sandbox_entrypoint_pid)
-                .await
-                .map_err(|error| {
-                    DestinationDenial::from_check(error, DestinationDenialKind::AllowedIps)
-                })?
+            resolve_and_check_allowed_ips(
+                host,
+                port,
+                &[network],
+                sandbox_entrypoint_pid,
+                static_hosts,
+            )
+            .await
+            .map_err(|error| {
+                DestinationDenial::from_check(error, DestinationDenialKind::AllowedIps)
+            })?
         }
         AddressAuthorization::ExactDeclaredHost => {
-            resolve_and_check_declared_endpoint(host, port, sandbox_entrypoint_pid)
+            resolve_and_check_declared_endpoint(host, port, sandbox_entrypoint_pid, static_hosts)
                 .await
                 .map_err(|error| {
                     DestinationDenial::from_check(error, DestinationDenialKind::DeclaredEndpoint)
                 })?
         }
         AddressAuthorization::DefaultPublicOnly => {
-            resolve_and_reject_internal(host, port, sandbox_entrypoint_pid)
+            resolve_and_reject_internal(host, port, sandbox_entrypoint_pid, static_hosts)
                 .await
                 .map_err(|error| {
                     DestinationDenial::from_check(error, DestinationDenialKind::InternalAddress)
@@ -391,11 +407,15 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
+    static EMPTY_STATIC_HOSTS: openshell_isolation_interface::static_hosts::StaticHosts =
+        openshell_isolation_interface::static_hosts::StaticHosts::empty();
+
     fn request<'a>(host: &'a str, plan: &'a DestinationValidationPlan) -> DestinationRequest<'a> {
         DestinationRequest {
             host,
             port: 80,
             sandbox_entrypoint_pid: 0,
+            static_hosts: &EMPTY_STATIC_HOSTS,
             plan,
         }
     }

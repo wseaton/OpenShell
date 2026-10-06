@@ -381,6 +381,13 @@ pub trait BoundBoundary: Send {
         None
     }
 
+    /// Driver-validated static host entries the supervisor answers in place
+    /// of its trusted resolver. Policy and destination checks still apply to
+    /// the returned addresses.
+    fn static_hosts(&self) -> crate::static_hosts::StaticHosts {
+        crate::static_hosts::StaticHosts::default()
+    }
+
     /// Confirm standing enforcement and return measured sandbox evidence.
     /// Confirmation fails closed and does not execute untrusted workload code.
     async fn confirm(self: Box<Self>) -> Result<ConfirmedBoundary, BackendError>;

@@ -293,6 +293,7 @@ pub fn bootstrap_archives(
             trust_anchor_pem: tls.trust_anchor_pem,
         },
         host_gateway_ip: Some(host_gateway_ip),
+        static_hosts: openshell_isolation_interface::static_hosts::StaticHosts::default(),
         resource_claims,
         workload_identity: identity.clone(),
         outer_fence,

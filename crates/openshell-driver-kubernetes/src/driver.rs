@@ -100,6 +100,7 @@ const ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: &str =
 const ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC: &str =
     "openshell.ai/sandbox-runtime-main-process-spec";
 const ANNOTATION_SANDBOX_RUNTIME_LOG_LEVEL: &str = "openshell.ai/sandbox-runtime-log-level";
+const ANNOTATION_SANDBOX_RUNTIME_STATIC_HOSTS: &str = "openshell.ai/sandbox-runtime-static-hosts";
 const ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: &str =
     "openshell.ai/sandbox-runtime-network-policy-uid";
 const ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION: &str =
@@ -388,11 +389,24 @@ impl KubernetesSandboxDriverConfig {
     }
 
     fn validate(&self) -> Result<(), String> {
+        self.static_hosts()?;
         validate_kubernetes_driver_volumes(&self.volumes)?;
         validate_kubernetes_driver_volume_mounts(
             &self.volumes,
             &self.containers.agent.volume_mounts,
         )
+    }
+
+    fn static_hosts(
+        &self,
+    ) -> Result<openshell_isolation_interface::static_hosts::StaticHosts, String> {
+        openshell_isolation_interface::static_hosts::StaticHosts::from_entries(
+            self.pod
+                .host_aliases
+                .iter()
+                .map(|(hostname, address)| (hostname, *address)),
+        )
+        .map_err(|err| format!("pod.host_aliases: {err}"))
     }
 
     fn has_explicit_sandbox_data_mount(&self) -> bool {
@@ -412,6 +426,9 @@ struct KubernetesPodDriverConfig {
     runtime_class_name: String,
     tolerations: Vec<serde_json::Value>,
     priority_class_name: String,
+    /// Hostname-to-address entries the sandbox supervisor answers in place
+    /// of its trusted resolver, for routable services without public DNS.
+    host_aliases: BTreeMap<String, std::net::IpAddr>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -2000,6 +2017,12 @@ impl KubernetesComputeDriver {
             ANNOTATION_SANDBOX_RUNTIME_LOG_LEVEL.to_string(),
             log_level.clone(),
         );
+        let static_hosts = Self::validate_driver_config_for_sandbox(sandbox)
+            .and_then(|config| config.static_hosts())
+            .map_err(KubernetesDriverError::InvalidArgument)?;
+        if let Some(value) = static_hosts_annotation(&static_hosts)? {
+            annotations.insert(ANNOTATION_SANDBOX_RUNTIME_STATIC_HOSTS.to_string(), value);
+        }
         for key in [
             crate::config::ANNOTATION_SCC_UID_RANGE,
             crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS,
@@ -2554,6 +2577,9 @@ impl KubernetesComputeDriver {
         }
         child_env.retain(|name, _| !name.starts_with("OPENSHELL_"));
         let host_gateway_ip = self.config.host_gateway_ip.parse().ok();
+        let static_hosts = Self::validate_driver_config_for_sandbox(sandbox)
+            .and_then(|config| config.static_hosts())
+            .map_err(KubernetesDriverError::Precondition)?;
         let session_id = launch_authentication.supervisor.session_id;
         let tls = generate_sandbox_tls_material(session_id)
             .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
@@ -2612,6 +2638,7 @@ impl KubernetesComputeDriver {
                 trust_anchor_pem: tls.trust_anchor_pem.clone(),
             },
             host_gateway_ip,
+            static_hosts,
             workload_identity,
             child_env,
         }
@@ -2718,6 +2745,7 @@ impl KubernetesComputeDriver {
         agent_uid: u32,
         agent_gid: u32,
         child_env: std::collections::HashMap<String, String>,
+        static_hosts: openshell_isolation_interface::static_hosts::StaticHosts,
         launch_authentication: &openshell_core::jwt::SandboxLaunchAuthentication,
     ) -> Result<(), KubernetesDriverError> {
         // Read once per call so the whole generation stages, mounts, and
@@ -2869,6 +2897,7 @@ impl KubernetesComputeDriver {
                 trust_anchor_pem: tls.trust_anchor_pem.clone(),
             },
             host_gateway_ip: self.config.host_gateway_ip.parse().ok(),
+            static_hosts,
             workload_identity,
             child_env,
         }
@@ -3215,6 +3244,7 @@ impl KubernetesComputeDriver {
         let main_process_spec =
             required_sandbox_annotation(&object, ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC)?;
         let log_level = required_sandbox_annotation(&object, ANNOTATION_SANDBOX_RUNTIME_LOG_LEVEL)?;
+        let static_hosts = static_hosts_from_sandbox_object(&object)?;
         let sandbox_name = annotation_or_label(&object, LABEL_SANDBOX_NAME).ok_or_else(|| {
             KubernetesDriverError::Precondition(
                 "Sandbox resource is missing its OpenShell sandbox name".to_string(),
@@ -3332,6 +3362,7 @@ impl KubernetesComputeDriver {
                 agent_uid,
                 agent_gid,
                 child_env,
+                static_hosts,
                 &launch_authentication,
             )
             .await
@@ -6770,6 +6801,37 @@ fn child_environment_from_sandbox_object(
         .collect()
 }
 
+fn static_hosts_annotation(
+    static_hosts: &openshell_isolation_interface::static_hosts::StaticHosts,
+) -> Result<Option<String>, KubernetesDriverError> {
+    if static_hosts.is_empty() {
+        return Ok(None);
+    }
+    serde_json::to_string(static_hosts)
+        .map(Some)
+        .map_err(|error| {
+            KubernetesDriverError::Message(format!("encode static hosts annotation: {error}"))
+        })
+}
+
+fn static_hosts_from_sandbox_object(
+    object: &DynamicObject,
+) -> Result<openshell_isolation_interface::static_hosts::StaticHosts, KubernetesDriverError> {
+    let Some(value) = object
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(ANNOTATION_SANDBOX_RUNTIME_STATIC_HOSTS))
+    else {
+        return Ok(openshell_isolation_interface::static_hosts::StaticHosts::default());
+    };
+    serde_json::from_str(value).map_err(|error| {
+        KubernetesDriverError::Precondition(format!(
+            "Sandbox resource annotation {ANNOTATION_SANDBOX_RUNTIME_STATIC_HOSTS} is invalid: {error}"
+        ))
+    })
+}
+
 fn required_sandbox_annotation(
     object: &DynamicObject,
     name: &str,
@@ -8975,6 +9037,115 @@ mod tests {
         let err = kubernetes_driver_config_for_spec(sandbox.spec.as_ref()).unwrap_err();
         assert!(err.contains("unknown field"));
         assert!(err.contains("gpu_device_ids"));
+    }
+
+    fn host_alias_template(aliases: serde_json::Value) -> SandboxTemplate {
+        SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "pod": { "host_aliases": aliases }
+            }))),
+            ..SandboxTemplate::default()
+        }
+    }
+
+    #[test]
+    fn driver_config_host_aliases_become_static_hosts() {
+        let template = host_alias_template(serde_json::json!({
+            "MAAS.Example.com": "150.239.114.201",
+            "db.example.com": "10.0.0.8"
+        }));
+        let static_hosts = KubernetesSandboxDriverConfig::from_template(&template)
+            .and_then(|config| config.static_hosts())
+            .unwrap();
+        assert_eq!(
+            static_hosts.lookup("maas.example.com"),
+            Some(["150.239.114.201".parse::<std::net::IpAddr>().unwrap()].as_slice())
+        );
+        assert_eq!(
+            static_hosts.lookup("db.example.com"),
+            Some(["10.0.0.8".parse::<std::net::IpAddr>().unwrap()].as_slice())
+        );
+    }
+
+    #[test]
+    fn driver_config_rejects_invalid_host_aliases() {
+        for aliases in [
+            serde_json::json!({ "maas.example.com": "not-an-ip" }),
+            serde_json::json!({ "host.openshell.internal": "10.0.0.1" }),
+            serde_json::json!({ "maas.example.com": "127.0.0.1" }),
+            serde_json::json!({ "bad_name": "10.0.0.1" }),
+            serde_json::json!(["maas.example.com"]),
+        ] {
+            let template = host_alias_template(aliases.clone());
+            let err = KubernetesSandboxDriverConfig::from_template(&template).unwrap_err();
+            assert!(
+                err.contains("invalid kubernetes driver_config"),
+                "{aliases}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn driver_config_host_aliases_do_not_render_pod_host_aliases() {
+        let spec = SandboxSpec {
+            template: Some(host_alias_template(serde_json::json!({
+                "maas.example.com": "150.239.114.201"
+            }))),
+            ..SandboxSpec::default()
+        };
+        let cr = sandbox_to_k8s_spec_for_test(Some(&spec), &SandboxPodParams::default());
+        assert!(
+            cr["spec"]["podTemplate"]["spec"]
+                .get("hostAliases")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn static_hosts_round_trip_through_the_sandbox_annotation() {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let mut object = DynamicObject::new("sandbox", &resource);
+        assert!(
+            static_hosts_from_sandbox_object(&object)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            static_hosts_annotation(
+                &openshell_isolation_interface::static_hosts::StaticHosts::default()
+            )
+            .unwrap(),
+            None
+        );
+
+        let static_hosts =
+            openshell_isolation_interface::static_hosts::StaticHosts::from_entries([(
+                "maas.example.com",
+                "150.239.114.201".parse::<std::net::IpAddr>().unwrap(),
+            )])
+            .unwrap();
+        let value = static_hosts_annotation(&static_hosts).unwrap().unwrap();
+        object.metadata.annotations = Some(BTreeMap::from([(
+            ANNOTATION_SANDBOX_RUNTIME_STATIC_HOSTS.to_string(),
+            value,
+        )]));
+        assert_eq!(
+            static_hosts_from_sandbox_object(&object).unwrap(),
+            static_hosts
+        );
+
+        object.metadata.annotations = Some(BTreeMap::from([(
+            ANNOTATION_SANDBOX_RUNTIME_STATIC_HOSTS.to_string(),
+            r#"{"localhost":["10.0.0.1"]}"#.to_string(),
+        )]));
+        assert!(matches!(
+            static_hosts_from_sandbox_object(&object),
+            Err(KubernetesDriverError::Precondition(_))
+        ));
     }
 
     #[test]

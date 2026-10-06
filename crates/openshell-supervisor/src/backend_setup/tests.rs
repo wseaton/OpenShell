@@ -559,6 +559,7 @@ fn standard_setup_decodes_native_descriptor_and_preserves_vm_identity() {
             trust_anchor_pem: String::new(),
         },
         host_gateway_ip: None,
+        static_hosts: openshell_isolation_interface::static_hosts::StaticHosts::default(),
         resource_claims: BTreeMap::new(),
         outer_fence: OuterFenceGuarantees::from_enforcement_evidence(
             "generation-1",

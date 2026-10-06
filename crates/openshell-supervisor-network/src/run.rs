@@ -199,6 +199,7 @@ pub async fn run_networking(
     upstream_proxy_args: &crate::upstream_proxy::UpstreamProxyArgs,
     proxy_tls_dir: Option<&std::path::Path>,
     host_gateway_ip: Option<IpAddr>,
+    static_hosts: openshell_isolation_interface::static_hosts::StaticHosts,
     #[cfg(target_os = "linux")] transparent_runtime: Option<TransparentRuntimeSetup>,
     network_mediation_source: Option<Arc<dyn NetworkMediationSource>>,
 ) -> Result<Networking> {
@@ -442,6 +443,7 @@ pub async fn run_networking(
             engine,
             source,
             host_gateway_ip,
+            static_hosts.clone(),
             crate::policy_dns::PolicyDnsRuntimeConfig::for_epoch(0)?,
             engine_ready_rx.clone(),
         )?)
@@ -487,6 +489,7 @@ pub async fn run_networking(
             engine_ready_rx,
             upstream_proxy_args,
             host_gateway_ip,
+            static_hosts.clone(),
             network_mediation_source,
             mediated_policy_dns
                 .as_ref()
@@ -513,6 +516,7 @@ pub async fn run_networking(
             runtime.dns_udp,
             runtime.dns_tcp,
             trusted_gateway,
+            static_hosts.clone(),
             runtime.config,
             policy_dns_engine_ready_rx,
         )?;

@@ -6,7 +6,9 @@
 use crate::opa::OpaEngine;
 use crate::policy_dns::resolver::MAX_DNS_MESSAGE_BYTES;
 use crate::policy_dns::store::{ResolvedEndpointStore, StoreConfig, SyntheticPools};
-use crate::policy_dns::{POLICY_LOCAL_ADDRESS, PolicyDnsService, SocketTrustedResolver, wire};
+use crate::policy_dns::{
+    POLICY_LOCAL_ADDRESS, PolicyDnsService, SocketTrustedResolver, StaticHostResolver, wire,
+};
 use futures::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::net::set_tcp_nodelay_best_effort;
@@ -96,6 +98,7 @@ impl PolicyDnsRuntime {
         policy: Arc<OpaEngine>,
         source: Arc<dyn NetworkMediationSource>,
         trusted_host_gateway: Option<IpAddr>,
+        static_hosts: openshell_isolation_interface::static_hosts::StaticHosts,
         config: PolicyDnsRuntimeConfig,
         mut engine_ready: tokio::sync::watch::Receiver<bool>,
     ) -> Result<Self> {
@@ -106,7 +109,7 @@ impl PolicyDnsRuntime {
         ));
         let service = Arc::new(PolicyDnsService::new(
             policy,
-            SocketTrustedResolver::new(upstream),
+            StaticHostResolver::new(static_hosts, SocketTrustedResolver::new(upstream)),
             store.clone(),
             trusted_host_gateway,
         ));
@@ -186,6 +189,7 @@ impl PolicyDnsRuntime {
         udp: tokio::net::UdpSocket,
         tcp: tokio::net::TcpListener,
         trusted_host_gateway: Option<IpAddr>,
+        static_hosts: openshell_isolation_interface::static_hosts::StaticHosts,
         config: PolicyDnsRuntimeConfig,
         engine_ready: tokio::sync::watch::Receiver<bool>,
     ) -> Result<Self> {
@@ -196,7 +200,7 @@ impl PolicyDnsRuntime {
         ));
         let service = Arc::new(PolicyDnsService::new(
             policy,
-            SocketTrustedResolver::new(upstream),
+            StaticHostResolver::new(static_hosts, SocketTrustedResolver::new(upstream)),
             store.clone(),
             trusted_host_gateway,
         ));
