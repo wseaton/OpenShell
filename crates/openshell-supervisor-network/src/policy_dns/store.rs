@@ -133,6 +133,7 @@ impl MappingLookup {
             host: self.record.normalized_name.as_str(),
             port: self.port,
             sandbox_entrypoint_pid: 0,
+            static_hosts: &openshell_isolation_interface::static_hosts::StaticHosts::default(),
             plan: &plan,
         })
         .await

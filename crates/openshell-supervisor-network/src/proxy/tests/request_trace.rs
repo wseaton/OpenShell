@@ -143,6 +143,7 @@ network_policies:
         ready_rx,
         &upstream_proxy::UpstreamProxyArgs::default(),
         None,
+        openshell_isolation_interface::static_hosts::StaticHosts::default(),
         None,
         None,
         Some(ContractBinaryIdentity {
@@ -431,6 +432,7 @@ network_policies:
                     AgentProposals::default(),
                     Arc::new(None),
                     Arc::new(None),
+                    Arc::new(openshell_isolation_interface::static_hosts::StaticHosts::default()),
                     None,
                     secret_resolver,
                     None,
@@ -853,6 +855,7 @@ network_policies:
                 AgentProposals::default(),
                 Arc::new(None),
                 Arc::new(None),
+                Arc::new(openshell_isolation_interface::static_hosts::StaticHosts::default()),
                 None,
                 None,
                 None,

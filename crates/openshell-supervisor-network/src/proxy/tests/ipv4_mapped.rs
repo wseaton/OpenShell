@@ -37,6 +37,7 @@ async fn probe(
         &BinaryIdentityCache::new(),
         None,
         None,
+        &openshell_isolation_interface::static_hosts::StaticHosts::default(),
         false,
         Some(&denial_tx),
         None,

@@ -567,6 +567,7 @@ impl OpenShellRuntimeBackend {
         };
         validate_runtime_descriptor(&runtime_descriptor, &sandbox)?;
         let host_gateway_ip = runtime_descriptor.host_gateway_ip;
+        let static_hosts = runtime_descriptor.static_hosts.clone();
         let resource_claims = runtime_descriptor.resource_claims.clone();
         let generation = runtime_descriptor.generation.clone();
         let session_id = runtime_descriptor.session_id;
@@ -618,6 +619,7 @@ impl OpenShellRuntimeBackend {
             sandbox_id: sandbox.sandbox_id,
             mediation: Arc::new(NetworkMediationSource { client }),
             host_gateway_ip,
+            static_hosts,
             ca_file_paths: self.ca_file_paths.clone(),
             provider_credentials: self.provider_credentials.clone(),
             identity: sandbox.identity,
@@ -765,6 +767,7 @@ pub struct BoundBoundary {
     sandbox_id: String,
     mediation: Arc<NetworkMediationSource>,
     host_gateway_ip: Option<std::net::IpAddr>,
+    static_hosts: openshell_isolation_interface::static_hosts::StaticHosts,
     ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
     provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
     identity: ResolvedWorkloadIdentity,
@@ -811,6 +814,10 @@ impl BoundBoundary {
     /// Whether the negotiated backend advertised suspend/resume support.
     pub fn supports_suspend(&self) -> bool {
         self.client.backend_supports_suspend.load(Ordering::Acquire)
+    }
+
+    pub fn static_hosts(&self) -> openshell_isolation_interface::static_hosts::StaticHosts {
+        self.static_hosts.clone()
     }
 
     pub async fn confirm(self: Box<Self>) -> Result<ConfirmedBoundary, BackendError> {
@@ -4633,6 +4640,7 @@ mod tests {
             },
             tls,
             host_gateway_ip: None,
+            static_hosts: openshell_isolation_interface::static_hosts::StaticHosts::default(),
             resource_claims: std::collections::BTreeMap::new(),
             provisioning_evidence: test_provisioning_evidence(),
         }
@@ -4845,6 +4853,7 @@ mod tests {
                 client: client.clone(),
             }),
             host_gateway_ip: None,
+            static_hosts: openshell_isolation_interface::static_hosts::StaticHosts::default(),
             ca_file_paths: Arc::new(std::sync::Mutex::new(None)),
             provider_credentials:
                 openshell_core::provider_credentials::ProviderCredentialState::from_environment(
@@ -4898,6 +4907,50 @@ mod tests {
     }
 
     #[test]
+    fn runtime_descriptor_omits_an_empty_static_host_table() {
+        let certificate = test_certificate();
+        let descriptor =
+            tls_runtime_descriptor("127.0.0.1:7000".parse().unwrap(), certificate.client_tls);
+        let payload = descriptor.backend_descriptor().unwrap().payload;
+        let json: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert!(json.get("static_hosts").is_none());
+        let decoded: SandboxRuntimeDescriptor = serde_json::from_slice(&payload).unwrap();
+        assert!(decoded.static_hosts.is_empty());
+    }
+
+    #[test]
+    fn runtime_descriptor_carries_static_hosts() {
+        let certificate = test_certificate();
+        let mut descriptor =
+            tls_runtime_descriptor("127.0.0.1:7000".parse().unwrap(), certificate.client_tls);
+        descriptor.static_hosts =
+            openshell_isolation_interface::static_hosts::StaticHosts::from_entries([(
+                "maas.example",
+                "150.239.114.201".parse::<std::net::IpAddr>().unwrap(),
+            )])
+            .unwrap();
+        let payload = descriptor.backend_descriptor().unwrap().payload;
+        let json: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            json["static_hosts"],
+            serde_json::json!({"maas.example": ["150.239.114.201"]})
+        );
+        let decoded: SandboxRuntimeDescriptor = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(decoded.static_hosts, descriptor.static_hosts);
+    }
+
+    #[test]
+    fn runtime_descriptor_rejects_an_invalid_static_host() {
+        let certificate = test_certificate();
+        let descriptor =
+            tls_runtime_descriptor("127.0.0.1:7000".parse().unwrap(), certificate.client_tls);
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&descriptor.backend_descriptor().unwrap().payload).unwrap();
+        json["static_hosts"] = serde_json::json!({"host.openshell.internal": ["10.0.0.1"]});
+        assert!(serde_json::from_value::<SandboxRuntimeDescriptor>(json).is_err());
+    }
+
+    #[test]
     fn runtime_descriptor_debug_redacts_trust_anchor() {
         let certificate = test_certificate();
         let runtime_descriptor = SandboxRuntimeDescriptor {
@@ -4910,6 +4963,7 @@ mod tests {
             },
             tls: certificate.client_tls.clone(),
             host_gateway_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            static_hosts: openshell_isolation_interface::static_hosts::StaticHosts::default(),
             resource_claims: std::collections::BTreeMap::new(),
             provisioning_evidence: test_provisioning_evidence(),
         };
@@ -4930,6 +4984,7 @@ mod tests {
             },
             tls: test_certificate().client_tls,
             host_gateway_ip: None,
+            static_hosts: openshell_isolation_interface::static_hosts::StaticHosts::default(),
             resource_claims: std::collections::BTreeMap::new(),
             provisioning_evidence: test_provisioning_evidence(),
         };
@@ -4952,6 +5007,7 @@ mod tests {
             },
             tls: test_certificate().client_tls,
             host_gateway_ip: None,
+            static_hosts: openshell_isolation_interface::static_hosts::StaticHosts::default(),
             resource_claims: std::collections::BTreeMap::new(),
             provisioning_evidence: test_provisioning_evidence(),
         };
@@ -4974,6 +5030,7 @@ mod tests {
             },
             tls: test_certificate().client_tls,
             host_gateway_ip: None,
+            static_hosts: openshell_isolation_interface::static_hosts::StaticHosts::default(),
             resource_claims: std::collections::BTreeMap::new(),
             provisioning_evidence: test_provisioning_evidence(),
         };
@@ -5289,6 +5346,7 @@ mod tests {
                 },
                 tls: certificate.client_tls,
                 host_gateway_ip: None,
+                static_hosts: openshell_isolation_interface::static_hosts::StaticHosts::default(),
                 resource_claims: std::collections::BTreeMap::new(),
                 provisioning_evidence: test_provisioning_evidence(),
             },
@@ -5794,6 +5852,7 @@ mod tests {
                 },
                 tls: certificate.client_tls,
                 host_gateway_ip: None,
+                static_hosts: openshell_isolation_interface::static_hosts::StaticHosts::default(),
                 resource_claims: std::collections::BTreeMap::new(),
                 provisioning_evidence: test_provisioning_evidence(),
             },
