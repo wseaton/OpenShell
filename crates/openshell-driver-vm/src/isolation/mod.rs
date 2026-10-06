@@ -121,6 +121,7 @@ impl VmBoundarySpec {
                 // reserved host aliases terminate at its loopback address
                 // after crossing the authenticated boundary channel.
                 host_gateway_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+                static_hosts: openshell_isolation_interface::static_hosts::StaticHosts::default(),
                 resource_claims,
                 provisioning_evidence,
             },

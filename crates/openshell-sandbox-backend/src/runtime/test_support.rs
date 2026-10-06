@@ -710,6 +710,7 @@ fn client(peer: Peer) -> Arc<BoundaryClient> {
             trust_anchor_pem: material.trust_anchor_pem,
         },
         host_gateway_ip: None,
+        static_hosts: openshell_isolation_interface::static_hosts::StaticHosts::default(),
         resource_claims: std::collections::BTreeMap::default(),
         provisioning_evidence: ProvisioningEvidence::from_enforcement_evidence("test", b"test")
             .unwrap(),

@@ -542,6 +542,9 @@ network_policies:
                             AgentProposals::default(),
                             Arc::new(None),
                             Arc::new(None),
+                            Arc::new(
+                                openshell_isolation_interface::static_hosts::StaticHosts::default(),
+                            ),
                             Arc::new(None),
                             None,
                             None,

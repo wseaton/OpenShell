@@ -385,6 +385,13 @@ pub struct SandboxRuntimeDescriptor {
     /// network supervisor cannot use the boundary's resolver view.
     #[serde(default)]
     pub host_gateway_ip: Option<std::net::IpAddr>,
+    /// Driver-validated static host entries the network supervisor answers
+    /// in place of its trusted resolver.
+    #[serde(
+        default,
+        skip_serializing_if = "openshell_isolation_interface::static_hosts::StaticHosts::is_empty"
+    )]
+    pub static_hosts: openshell_isolation_interface::static_hosts::StaticHosts,
     /// Driver-specific immutable resource coordinates bound at attach (for
     /// example pod UID, VM generation, or container ID).
     #[serde(default)]
@@ -403,6 +410,7 @@ impl fmt::Debug for SandboxRuntimeDescriptor {
             .field("transport", &self.transport)
             .field("tls", &self.tls)
             .field("host_gateway_ip", &self.host_gateway_ip)
+            .field("static_hosts", &self.static_hosts)
             .field("resource_claims", &self.resource_claims)
             .field("provisioning_evidence", &self.provisioning_evidence)
             .finish()

@@ -24,7 +24,9 @@ mod store;
 mod wire;
 
 pub(crate) use name::NormalizedName;
-pub(crate) use resolver::{AddressFamily, SocketTrustedResolver, TrustedAnswer, TrustedResolver};
+pub(crate) use resolver::{
+    AddressFamily, SocketTrustedResolver, StaticHostResolver, TrustedAnswer, TrustedResolver,
+};
 pub(crate) use runtime::{PolicyDnsRuntime, PolicyDnsRuntimeConfig};
 pub(crate) use store::{
     MappingLookup, MappingLookupError, PolicyEndpointId, PublishError, PublishRequest,
@@ -1114,6 +1116,90 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         assert!(shorthand.contains("resolved=10.2.3.4,10.2.3.5"));
         assert!(shorthand.contains(&format!("synthetic={}", answer.address)));
         assert!(shorthand.contains(&format!("mapping_id={}", answer.mapping_id)));
+    }
+
+    fn static_service(
+        policy_yaml: &str,
+        static_hosts: &[(&str, &str)],
+        fallback: Vec<IpAddr>,
+    ) -> PolicyDnsService<StaticHostResolver<FakeResolver>> {
+        let fallback = service(policy_yaml, fallback);
+        let static_hosts = openshell_isolation_interface::static_hosts::StaticHosts::from_entries(
+            static_hosts
+                .iter()
+                .map(|(name, address)| (*name, address.parse::<IpAddr>().unwrap())),
+        )
+        .unwrap();
+        PolicyDnsService::new(
+            fallback.policy,
+            StaticHostResolver::new(static_hosts, fallback.resolver),
+            fallback.store,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn static_host_answers_in_place_of_the_trusted_resolver() {
+        let service = static_service(
+            BASE_POLICY,
+            &[("db.example", "10.9.9.9")],
+            vec!["10.2.3.4".parse().unwrap()],
+        );
+        let now = Instant::now();
+        let answer = service
+            .answer_query("DB.Example.", AddressFamily::Ipv4, now)
+            .await
+            .unwrap();
+        let mapping = service
+            .store
+            .lookup(answer.address, 5432, answer.policy_generation, now)
+            .unwrap();
+        assert_eq!(
+            mapping.record.contracts[0].pinned_addresses,
+            ["10.9.9.9".parse::<IpAddr>().unwrap()]
+        );
+    }
+
+    #[tokio::test]
+    async fn static_host_without_the_queried_family_has_no_data() {
+        let service = static_service(BASE_POLICY, &[("db.example", "10.9.9.9")], vec![]);
+        let result = service
+            .answer_query("db.example", AddressFamily::Ipv6, Instant::now())
+            .await;
+        assert!(matches!(
+            result,
+            Err(PolicyDnsError::Resolver(resolver::ResolveError::NoData))
+        ));
+    }
+
+    #[tokio::test]
+    async fn static_host_answers_still_pass_destination_rules() {
+        let yaml = BASE_POLICY.replace("db.example", "'*.example.com'");
+        let service = static_service(&yaml, &[("db.example.com", "10.9.9.9")], vec![]);
+        let result = service
+            .answer_query("db.example.com", AddressFamily::Ipv4, Instant::now())
+            .await;
+        assert!(matches!(result, Err(PolicyDnsError::NoValidAddress)));
+    }
+
+    #[tokio::test]
+    async fn static_host_does_not_make_an_unlisted_name_eligible() {
+        let service = static_service(BASE_POLICY, &[("other.example", "203.0.113.9")], vec![]);
+        let now = Instant::now();
+        let answer = service
+            .answer_query("other.example", AddressFamily::Ipv4, now)
+            .await
+            .expect("unapproved name receives a local synthetic address");
+        let generation = service.policy.current_generation();
+        assert!(matches!(
+            service.store.lookup(answer.address, 443, generation, now),
+            Err(MappingLookupError::PortMismatch)
+        ));
+        let intent = service
+            .store
+            .lookup_intent(answer.address, 443, generation, now)
+            .unwrap();
+        assert!(intent.record.is_observation());
     }
 
     #[tokio::test]

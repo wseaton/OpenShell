@@ -48,6 +48,7 @@ impl DelegatedLaunch {
             transport,
             tls: self.tls,
             host_gateway_ip: self.host_gateway_ip,
+            static_hosts: openshell_isolation_interface::static_hosts::StaticHosts::default(),
             resource_claims: self.resource_claims,
             provisioning_evidence: self.provisioning_evidence,
         };
