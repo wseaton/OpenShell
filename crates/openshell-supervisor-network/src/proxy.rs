@@ -7507,6 +7507,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                 AgentProposals::default(),
                 Arc::new(None),
                 Arc::new(None),
+                Arc::new(openshell_isolation_interface::static_hosts::StaticHosts::default()),
                 Arc::new(None),
                 Some(credentials),
                 None,
@@ -7602,6 +7603,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                 &BinaryIdentityCache::new(),
                 None,
                 None,
+                &openshell_isolation_interface::static_hosts::StaticHosts::default(),
                 false,
                 None,
             )
