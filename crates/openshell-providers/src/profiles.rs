@@ -3593,9 +3593,23 @@ credentials:
 
         let exact = ProviderTypeProfile::from_proto(&proto);
         let yaml = profile_to_yaml(&exact).unwrap();
-        assert!(yaml.contains("refresh_before: \"0s\""), "{yaml}");
-        assert!(yaml.contains("max_lifetime: \"1.500s\""), "{yaml}");
-        assert!(yaml.contains("cache_ttl: \"0.500s\""), "{yaml}");
+        let emitted: serde_yml::Value = serde_yml::from_str(&yaml).unwrap();
+        let credential = &emitted["credentials"][0];
+        assert_eq!(
+            credential["refresh"]["refresh_before"].as_str(),
+            Some("0s"),
+            "{yaml}"
+        );
+        assert_eq!(
+            credential["refresh"]["max_lifetime"].as_str(),
+            Some("1.500s"),
+            "{yaml}"
+        );
+        assert_eq!(
+            credential["token_grant"]["cache_ttl"].as_str(),
+            Some("0.500s"),
+            "{yaml}"
+        );
         assert!(!yaml.contains("refresh_before_seconds"));
         assert!(!yaml.contains("max_lifetime_seconds"));
         assert!(!yaml.contains("cache_ttl_seconds"));
