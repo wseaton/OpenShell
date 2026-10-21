@@ -480,7 +480,32 @@ where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
 {
-    T::deserialize(deserializer).map(Some)
+    struct NonNull<T>(std::marker::PhantomData<T>);
+
+    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for NonNull<T> {
+        type Value = Option<T>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a non-null value")
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Err(E::invalid_type(serde::de::Unexpected::Option, &self))
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Err(E::invalid_type(serde::de::Unexpected::Unit, &self))
+        }
+
+        fn visit_some<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> std::result::Result<Self::Value, D::Error> {
+            T::deserialize(deserializer).map(Some)
+        }
+    }
+
+    deserializer.deserialize_option(NonNull(std::marker::PhantomData))
 }
 
 const MAX_UNKNOWN_FIELD_PATH_BYTES: usize = 1_024;
