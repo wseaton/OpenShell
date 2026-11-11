@@ -16,7 +16,7 @@ pub use config::{
     DEFAULT_GATEWAY_ID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_WORKSPACE_STORAGE_SIZE,
     KubernetesComputeConfig, KubernetesControlConnection, KubernetesImagePullPolicy,
     KubernetesSandboxRuntimeConfig, ManagedSshIngressConfig, SharedSupervisorConfig,
-    SupervisorTopology, WorkspaceMode, managed_namespace_prefix,
+    SupervisorTopology, WorkspaceMode, WorkspacePersistence, managed_namespace_prefix,
 };
 pub use driver::{KubernetesComputeDriver, KubernetesDriverError};
 pub use grpc::ComputeDriverService;
