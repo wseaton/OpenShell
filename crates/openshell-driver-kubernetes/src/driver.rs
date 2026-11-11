@@ -1778,6 +1778,7 @@ impl KubernetesComputeDriver {
             image_pull_secrets: &self.config.image_pull_secrets,
             default_runtime_class_name: &self.config.default_runtime_class_name,
             service_account_name: &self.config.service_account_name,
+            workspace_persistence: self.config.workspace_persistence,
             ..Default::default()
         };
         let rendered = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params)
@@ -2071,6 +2072,7 @@ impl KubernetesComputeDriver {
             enable_user_namespaces: self.config.enable_user_namespaces,
             workspace_default_storage_size: &self.config.workspace_default_storage_size,
             workspace_storage_class: &self.config.workspace_storage_class,
+            workspace_persistence: self.config.workspace_persistence,
             default_runtime_class_name: &self.config.default_runtime_class_name,
             sandbox_uid: resolved_user_id,
             sandbox_gid: resolved_group_id,
@@ -6329,6 +6331,11 @@ fn apply_workspace_persistence(
     }
 }
 
+/// The workspace volume under `WorkspacePersistence::Ephemeral`.
+fn empty_dir_workspace_volume() -> serde_json::Value {
+    serde_json::json!({"name": WORKSPACE_VOLUME_NAME, "emptyDir": {}})
+}
+
 /// Build the default `volumeClaimTemplates` array for sandbox pods.
 ///
 /// Provides a single PVC named "workspace" that backs the `/sandbox`
@@ -6379,6 +6386,7 @@ struct SandboxPodParams<'a> {
     enable_user_namespaces: bool,
     workspace_default_storage_size: &'a str,
     workspace_storage_class: &'a str,
+    workspace_persistence: crate::WorkspacePersistence,
     default_runtime_class_name: &'a str,
     /// Resolved sandbox UID for supervisor `runAsUser` and env var.
     sandbox_uid: u32,
@@ -6403,6 +6411,7 @@ impl Default for SandboxPodParams<'_> {
             enable_user_namespaces: false,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE,
             workspace_storage_class: "",
+            workspace_persistence: crate::WorkspacePersistence::Pvc,
             default_runtime_class_name: "",
             sandbox_uid: DEFAULT_SANDBOX_UID,
             sandbox_gid: DEFAULT_SANDBOX_UID,
@@ -6476,7 +6485,7 @@ fn sandbox_to_k8s_spec(
         }
     }
 
-    if inject_workspace {
+    if inject_workspace && params.workspace_persistence == crate::WorkspacePersistence::Pvc {
         root.insert(
             "volumeClaimTemplates".to_string(),
             default_workspace_volume_claim_templates(
@@ -6698,11 +6707,14 @@ fn sandbox_template_to_k8s_with_validated_config(
         serde_json::Value::Array(vec![serde_json::Value::Object(container)]),
     );
 
-    let volumes = driver_config
+    let mut volumes = driver_config
         .volumes
         .iter()
         .map(kubernetes_driver_volume_to_k8s)
         .collect::<Vec<_>>();
+    if inject_workspace && params.workspace_persistence == crate::WorkspacePersistence::Ephemeral {
+        volumes.push(empty_dir_workspace_volume());
+    }
     spec.insert("volumes".to_string(), serde_json::Value::Array(volumes));
 
     let mut template_value = serde_json::Map::new();
@@ -10871,6 +10883,97 @@ mod tests {
             !has_pvc_vol,
             "apply_workspace_persistence must NOT add a PVC volume (the CRD controller does that)"
         );
+    }
+
+    #[test]
+    fn ephemeral_workspace_renders_an_empty_dir_and_no_claim() {
+        let params = SandboxPodParams {
+            workspace_persistence: crate::WorkspacePersistence::Ephemeral,
+            workspace_storage_class: "fast-ssd",
+            ..SandboxPodParams::default()
+        };
+        let rendered = sandbox_to_k8s_spec(None, &params).unwrap();
+        let spec = rendered["spec"].as_object().unwrap();
+        assert!(!spec.contains_key("volumeClaimTemplates"));
+
+        let pod = &spec["podTemplate"]["spec"];
+        let workspace: Vec<_> = pod["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["name"] == WORKSPACE_VOLUME_NAME)
+            .collect();
+        assert_eq!(workspace.len(), 1);
+        assert_eq!(workspace[0]["emptyDir"], serde_json::json!({}));
+        assert!(workspace[0]["persistentVolumeClaim"].is_null());
+
+        let agent_mount = pod["containers"][0]["volumeMounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["name"] == WORKSPACE_VOLUME_NAME)
+            .expect("agent mounts the workspace");
+        assert_eq!(agent_mount["mountPath"], WORKSPACE_MOUNT_PATH);
+        let init = pod["initContainers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == WORKSPACE_INIT_CONTAINER_NAME)
+            .expect("the workspace init container still seeds the volume");
+        let init_mount = init["volumeMounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["name"] == WORKSPACE_VOLUME_NAME)
+            .expect("the init container mounts the workspace");
+        assert_eq!(init_mount["mountPath"], WORKSPACE_INIT_MOUNT_PATH);
+    }
+
+    #[test]
+    fn pvc_workspace_renders_a_claim_and_no_pod_volume() {
+        let rendered = sandbox_to_k8s_spec(None, &SandboxPodParams::default()).unwrap();
+        let spec = rendered["spec"].as_object().unwrap();
+        assert_eq!(
+            spec["volumeClaimTemplates"][0]["metadata"]["name"],
+            WORKSPACE_VOLUME_NAME
+        );
+        let has_pod_volume = spec["podTemplate"]["spec"]["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["name"] == WORKSPACE_VOLUME_NAME);
+        assert!(!has_pod_volume);
+    }
+
+    #[test]
+    fn ephemeral_workspace_yields_to_an_explicit_sandbox_mount() {
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "volumes": [{
+                        "name": "user-data",
+                        "persistent_volume_claim": {"claim_name": "user-data", "read_only": false}
+                    }],
+                    "containers": {"agent": {"volume_mounts": [{
+                        "name": "user-data",
+                        "mount_path": "/sandbox/.openshell/workspace",
+                        "sub_path": "workspace",
+                        "read_only": false
+                    }]}}
+                }))),
+                ..SandboxTemplate::default()
+            }),
+            ..SandboxSpec::default()
+        };
+        let params = SandboxPodParams {
+            workspace_persistence: crate::WorkspacePersistence::Ephemeral,
+            ..SandboxPodParams::default()
+        };
+        let rendered = sandbox_to_k8s_spec(Some(&spec), &params).unwrap();
+        let volumes = rendered["spec"]["podTemplate"]["spec"]["volumes"]
+            .as_array()
+            .unwrap();
+        assert!(volumes.iter().all(|v| v["name"] != WORKSPACE_VOLUME_NAME));
     }
 
     #[test]

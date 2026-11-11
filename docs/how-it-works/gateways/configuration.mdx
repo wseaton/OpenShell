@@ -951,6 +951,10 @@ workspace_default_storage_size = "10Gi"
 # field, using the cluster's default StorageClass. Set this on clusters with no
 # default StorageClass, otherwise the workspace PVC stays Pending.
 # workspace_storage_class      = "fast-ssd"
+# What backs the workspace volume. "pvc" (default) keeps /sandbox across pod
+# rescheduling. "ephemeral" uses an emptyDir: the pod can run on any node, and
+# /sandbox is deleted with it.
+# workspace_persistence        = "ephemeral"
 # Kubernetes RuntimeClass applied to sandbox pods when the API request does
 # not specify one. Empty (default) = omit the field, using the cluster default.
 # default_runtime_class_name   = "kata-containers"

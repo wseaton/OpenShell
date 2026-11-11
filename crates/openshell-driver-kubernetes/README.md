@@ -169,6 +169,11 @@ runtime via `OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE` and
 that OpenShell provisions automatically; they have no effect when a `driver_config`
 mount attaches an existing PVC under `/sandbox`, which skips the default PVC.
 
+Set `workspace_persistence = "ephemeral"` (or `OPENSHELL_K8S_WORKSPACE_PERSISTENCE=ephemeral`)
+to back the workspace with an `emptyDir` instead of a PVC. The pod then schedules on
+any node, whatever the cluster's storage offers, and `/sandbox` is deleted with the
+pod. The init container still seeds it from the image. The default is `"pvc"`.
+
 ## Credentials, TLS, and Relay
 
 Both Pods set `automountServiceAccountToken: false`. The supervisor receives an

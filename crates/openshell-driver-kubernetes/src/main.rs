@@ -13,7 +13,7 @@ use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServ
 use openshell_driver_kubernetes::{
     ComputeDriverService, DEFAULT_GATEWAY_ID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
     KubernetesComputeConfig, KubernetesComputeDriver, KubernetesImagePullPolicy,
-    KubernetesSandboxRuntimeConfig, ManagedSshIngressConfig, WorkspaceMode,
+    KubernetesSandboxRuntimeConfig, ManagedSshIngressConfig, WorkspaceMode, WorkspacePersistence,
 };
 
 #[derive(Parser, Debug)]
@@ -257,6 +257,13 @@ async fn main() -> Result<()> {
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
 
+    let workspace_persistence = match std::env::var("OPENSHELL_K8S_WORKSPACE_PERSISTENCE") {
+        Ok(value) => value
+            .parse::<WorkspacePersistence>()
+            .map_err(|error| miette::miette!("OPENSHELL_K8S_WORKSPACE_PERSISTENCE: {error}"))?,
+        Err(_) => WorkspacePersistence::default(),
+    };
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let driver = KubernetesComputeDriver::new(
         KubernetesComputeConfig {
@@ -315,6 +322,7 @@ async fn main() -> Result<()> {
             }),
             workspace_storage_class: std::env::var("OPENSHELL_K8S_WORKSPACE_STORAGE_CLASS")
                 .unwrap_or_default(),
+            workspace_persistence,
             default_runtime_class_name: std::env::var("OPENSHELL_K8S_DEFAULT_RUNTIME_CLASS_NAME")
                 .unwrap_or_default(),
             allowed_pod_annotations: args.allowed_pod_annotations,

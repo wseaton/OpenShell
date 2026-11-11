@@ -99,6 +99,43 @@ impl KubernetesSandboxRuntimeConfig {
     }
 }
 
+/// What backs a sandbox's default `/sandbox` workspace volume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkspacePersistence {
+    /// A `PersistentVolumeClaim` per sandbox, so `/sandbox` survives pod
+    /// rescheduling. The pod can only run where the claim's `StorageClass`
+    /// can provision.
+    #[default]
+    Pvc,
+    /// An `emptyDir` on the pod's node, deleted with the pod. The pod can
+    /// run on any node.
+    Ephemeral,
+}
+
+impl std::fmt::Display for WorkspacePersistence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pvc => f.write_str("pvc"),
+            Self::Ephemeral => f.write_str("ephemeral"),
+        }
+    }
+}
+
+impl FromStr for WorkspacePersistence {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pvc" => Ok(Self::Pvc),
+            "ephemeral" => Ok(Self::Ephemeral),
+            other => Err(format!(
+                "unknown workspace persistence '{other}'; expected 'pvc' or 'ephemeral'"
+            )),
+        }
+    }
+}
+
 /// How workspaces map to Kubernetes namespaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -268,6 +305,11 @@ pub struct KubernetesComputeConfig {
     /// `StorageClass`, otherwise the workspace PVC stays `Pending` and the
     /// sandbox never starts.
     pub workspace_storage_class: String,
+    /// What backs the default workspace volume. `"pvc"` (default) keeps
+    /// `/sandbox` across pod rescheduling; `"ephemeral"` uses an `emptyDir`
+    /// and ignores `workspace_default_storage_size` and
+    /// `workspace_storage_class`.
+    pub workspace_persistence: WorkspacePersistence,
     /// Default Kubernetes `runtimeClassName` for sandbox pods.
     /// Applied when a `CreateSandbox` request does not specify one.
     /// Empty string (default) = omit the field, using the cluster default.
@@ -387,6 +429,7 @@ impl Default for KubernetesComputeConfig {
             enable_user_namespaces: false,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE.to_string(),
             workspace_storage_class: String::new(),
+            workspace_persistence: WorkspacePersistence::default(),
             default_runtime_class_name: String::new(),
             allowed_pod_annotations: Vec::new(),
             allowed_pod_labels: Vec::new(),
@@ -1006,6 +1049,33 @@ mod tests {
             cfg.workspace_default_storage_size,
             DEFAULT_WORKSPACE_STORAGE_SIZE
         );
+    }
+
+    #[test]
+    fn default_workspace_persistence_is_pvc() {
+        let cfg = KubernetesComputeConfig::default();
+        assert_eq!(cfg.workspace_persistence, WorkspacePersistence::Pvc);
+    }
+
+    #[test]
+    fn serde_override_workspace_persistence_ephemeral() {
+        let json = serde_json::json!({ "workspace_persistence": "ephemeral" });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.workspace_persistence, WorkspacePersistence::Ephemeral);
+    }
+
+    #[test]
+    fn serde_rejects_unknown_workspace_persistence() {
+        let json = serde_json::json!({ "workspace_persistence": "tmpfs" });
+        assert!(serde_json::from_value::<KubernetesComputeConfig>(json).is_err());
+    }
+
+    #[test]
+    fn workspace_persistence_parses_and_displays_round_trip() {
+        for mode in [WorkspacePersistence::Pvc, WorkspacePersistence::Ephemeral] {
+            assert_eq!(mode.to_string().parse::<WorkspacePersistence>(), Ok(mode));
+        }
+        assert!("tmpfs".parse::<WorkspacePersistence>().is_err());
     }
 
     #[test]
