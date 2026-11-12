@@ -1131,7 +1131,7 @@ impl KubernetesComputeDriver {
 
         let gateway_id = &self.config.gateway_id;
         for obj in &list {
-            if !gateway_id_label_needs_backfill(obj.metadata.labels.as_ref(), gateway_id) {
+            if !gateway_id_label_needs_backfill(obj.metadata.labels.as_ref()) {
                 continue;
             }
             let Some(name) = obj.metadata.name.as_deref() else {
@@ -4984,13 +4984,8 @@ fn is_namespace_owned_by_gateway(
             .is_some_and(|v| v == gateway_id)
 }
 
-fn gateway_id_label_needs_backfill(
-    labels: Option<&BTreeMap<String, String>>,
-    gateway_id: &str,
-) -> bool {
-    labels
-        .and_then(|labels| labels.get(LABEL_GATEWAY_ID))
-        .is_none_or(|value| value != gateway_id)
+fn gateway_id_label_needs_backfill(labels: Option<&BTreeMap<String, String>>) -> bool {
+    labels.is_none_or(|labels| !labels.contains_key(LABEL_GATEWAY_ID))
 }
 
 fn namespace_delete_params(uid: String) -> DeleteParams {
@@ -11803,19 +11798,14 @@ mod tests {
             LABEL_MANAGED_BY.to_string(),
             LABEL_MANAGED_BY_VALUE.to_string(),
         )]);
-        assert!(gateway_id_label_needs_backfill(Some(&labels), "gw-1"));
+        assert!(gateway_id_label_needs_backfill(Some(&labels)));
+        assert!(gateway_id_label_needs_backfill(None));
     }
 
     #[test]
-    fn gateway_id_backfill_adopts_sandbox_from_previous_gateway() {
-        let labels = BTreeMap::from([(LABEL_GATEWAY_ID.to_string(), "gw-old".to_string())]);
-        assert!(gateway_id_label_needs_backfill(Some(&labels), "gw-1"));
-    }
-
-    #[test]
-    fn gateway_id_backfill_skips_sandbox_already_owned_by_gateway() {
-        let labels = BTreeMap::from([(LABEL_GATEWAY_ID.to_string(), "gw-1".to_string())]);
-        assert!(!gateway_id_label_needs_backfill(Some(&labels), "gw-1"));
+    fn gateway_id_backfill_leaves_another_gateways_sandbox_alone() {
+        let labels = BTreeMap::from([(LABEL_GATEWAY_ID.to_string(), "gw-other".to_string())]);
+        assert!(!gateway_id_label_needs_backfill(Some(&labels)));
     }
 
     #[test]
