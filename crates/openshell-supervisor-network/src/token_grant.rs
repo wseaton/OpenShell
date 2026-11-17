@@ -56,6 +56,11 @@ static TOKEN_GRANT_HTTP_CLIENT: LazyLock<Result<TokenGrantClient, TokenGrantFail
 const DEFAULT_TOKEN_CACHE_TTL_SECONDS: i64 = 300;
 const TOKEN_CACHE_EXPIRY_SKEW_SECONDS: i64 = 30;
 const MAX_TOKEN_EXPIRES_IN_SECONDS: i64 = 3600;
+const IDENTITY_REGISTRATION_GRACE: Duration = Duration::from_secs(10);
+const IDENTITY_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(50);
+const IDENTITY_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(500);
+static IDENTITY_REGISTRATION_DEADLINE: LazyLock<tokio::time::Instant> =
+    LazyLock::new(|| tokio::time::Instant::now() + IDENTITY_REGISTRATION_GRACE);
 
 /// Cached access token with expiration metadata.
 #[derive(Clone)]
@@ -320,10 +325,35 @@ async fn fetch_jwt_svid_from_socket(
 
     // Fetch JWT-SVID with token service audience
     // None = use the sandbox's default SPIFFE ID
-    client
-        .fetch_jwt_token([audience], None)
-        .await
-        .map_err(workload_api_failure)
+    fetch_once_identity_is_registered(*IDENTITY_REGISTRATION_DEADLINE, || {
+        client.fetch_jwt_token([audience], None)
+    })
+    .await
+    .map_err(workload_api_failure)
+}
+
+async fn fetch_once_identity_is_registered<T, F, Fut>(
+    deadline: tokio::time::Instant,
+    mut fetch: F,
+) -> Result<T, WorkloadApiError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, WorkloadApiError>>,
+{
+    let mut backoff = IDENTITY_RETRY_INITIAL_BACKOFF;
+    loop {
+        match fetch().await {
+            Err(WorkloadApiError::NoIdentityIssued) => {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Err(WorkloadApiError::NoIdentityIssued);
+                }
+                tokio::time::sleep_until((now + backoff).min(deadline)).await;
+                backoff = (backoff * 2).min(IDENTITY_RETRY_MAX_BACKOFF);
+            }
+            result => return result,
+        }
+    }
 }
 
 fn workload_api_failure(error: WorkloadApiError) -> TokenGrantFailure {
@@ -969,6 +999,115 @@ mod tests {
             assert_eq!(failure.kind(), kind);
             assert_eq!(failure.stage(), TokenGrantStage::WorkloadIdentity);
         }
+    }
+
+    async fn fetch_with_identity_after(
+        unregistered_fetches: usize,
+        deadline: tokio::time::Instant,
+    ) -> (Result<&'static str, WorkloadApiError>, usize) {
+        let calls = AtomicUsize::new(0);
+        let result = fetch_once_identity_is_registered(deadline, || {
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if call < unregistered_fetches {
+                    Err(WorkloadApiError::NoIdentityIssued)
+                } else {
+                    Ok("jwt-svid")
+                }
+            }
+        })
+        .await;
+        (result, calls.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registered_identity_is_fetched_once_without_waiting() {
+        let start = tokio::time::Instant::now();
+        let (result, calls) =
+            fetch_with_identity_after(0, start + IDENTITY_REGISTRATION_GRACE).await;
+        assert_eq!(result.unwrap(), "jwt-svid");
+        assert_eq!(calls, 1);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn identity_registered_within_the_grace_is_fetched_after_backing_off() {
+        let start = tokio::time::Instant::now();
+        let (result, calls) =
+            fetch_with_identity_after(3, start + IDENTITY_REGISTRATION_GRACE).await;
+        assert_eq!(result.unwrap(), "jwt-svid");
+        assert_eq!(calls, 4);
+        assert_eq!(start.elapsed(), Duration::from_millis(50 + 100 + 200));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backoff_between_identity_fetches_is_capped() {
+        let start = tokio::time::Instant::now();
+        let (result, calls) =
+            fetch_with_identity_after(6, start + IDENTITY_REGISTRATION_GRACE).await;
+        assert_eq!(result.unwrap(), "jwt-svid");
+        assert_eq!(calls, 7);
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_millis(50 + 100 + 200 + 400 + 500 + 500)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn identity_never_registered_fails_at_the_deadline_after_a_last_fetch() {
+        let start = tokio::time::Instant::now();
+        let (result, calls) =
+            fetch_with_identity_after(usize::MAX, start + Duration::from_millis(200)).await;
+        assert!(matches!(result, Err(WorkloadApiError::NoIdentityIssued)));
+        assert_eq!(calls, 4);
+        assert_eq!(start.elapsed(), Duration::from_millis(200));
+        let failure = workload_api_failure(result.unwrap_err());
+        assert_eq!(
+            failure.kind(),
+            TokenGrantFailureKind::WorkloadIdentityRejected
+        );
+        assert_eq!(failure.stage(), TokenGrantStage::WorkloadIdentity);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_identity_after_the_deadline_fails_without_waiting() {
+        let start = tokio::time::Instant::now();
+        tokio::time::advance(IDENTITY_REGISTRATION_GRACE).await;
+        let (result, calls) = fetch_with_identity_after(usize::MAX, start).await;
+        assert!(matches!(result, Err(WorkloadApiError::NoIdentityIssued)));
+        assert_eq!(calls, 1);
+        assert_eq!(start.elapsed(), IDENTITY_REGISTRATION_GRACE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn other_workload_api_failures_are_not_retried() {
+        for status in [
+            tonic::Status::permission_denied("secret-spiffe-canary"),
+            tonic::Status::unavailable("secret-canary"),
+            tonic::Status::deadline_exceeded("secret-canary"),
+        ] {
+            let start = tokio::time::Instant::now();
+            let calls = AtomicUsize::new(0);
+            let result: Result<&str, WorkloadApiError> =
+                fetch_once_identity_is_registered(start + IDENTITY_REGISTRATION_GRACE, || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let status = status.clone();
+                    async move { Err(WorkloadApiError::from(status)) }
+                })
+                .await;
+            assert!(!matches!(result, Err(WorkloadApiError::NoIdentityIssued)));
+            assert!(result.is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(start.elapsed(), Duration::ZERO);
+        }
+    }
+
+    #[test]
+    fn a_no_identity_issued_status_is_the_retried_failure() {
+        assert!(matches!(
+            WorkloadApiError::from(tonic::Status::permission_denied("no identity issued")),
+            WorkloadApiError::NoIdentityIssued
+        ));
     }
 
     #[test]
